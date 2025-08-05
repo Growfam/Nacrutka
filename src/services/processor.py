@@ -9,11 +9,15 @@ from decimal import Decimal
 from src.database.connection import DatabaseConnection
 from src.database.queries import Queries
 from src.database.models import *
-from src.services.nakrutka import NakrutkaClient
-from src.services.portion_calculator import PortionCalculator, ReactionDistributor
+from src.services.nakrutka import NakrutkaClient, NakrutkaError
+from src.services.portion_calculator import (
+    PortionCalculator,
+    ReactionDistributor,
+    DynamicPortionOptimizer
+)
 from src.config import POST_STATUS, ORDER_STATUS, PORTION_STATUS, SERVICE_TYPES
 from src.utils.logger import get_logger, DatabaseLogger
-from src.utils.helpers import calculate_cost
+from src.utils.helpers import calculate_cost, ErrorRecovery
 from src.utils.validators import DataValidator, OrderValidator, validate_before_processing
 
 logger = get_logger(__name__)
@@ -28,6 +32,9 @@ class PostProcessor:
         self.queries = Queries(db)
         self.db_logger = DatabaseLogger(db)
         self._processing_lock = asyncio.Lock()
+        self._channel_configs_cache = {}
+        self._cache_ttl = 300  # 5 minutes
+        self._optimizer = DynamicPortionOptimizer()
 
     async def process_new_posts(self):
         """Process all posts with 'new' status"""
@@ -42,41 +49,74 @@ class PostProcessor:
 
                 logger.info(f"Processing {len(new_posts)} new posts")
 
-                # Process each post
+                # Group posts by channel for optimization
+                posts_by_channel = {}
                 for post in new_posts:
+                    if post.channel_id not in posts_by_channel:
+                        posts_by_channel[post.channel_id] = []
+                    posts_by_channel[post.channel_id].append(post)
+
+                # Process each channel's posts
+                for channel_id, channel_posts in posts_by_channel.items():
                     try:
-                        await self.process_single_post(post)
-                        # Small delay between posts to avoid rate limits
-                        await asyncio.sleep(2)
+                        # Load channel config once
+                        config = await self._get_channel_config(channel_id)
+                        if not config:
+                            logger.error(f"No configuration for channel {channel_id}")
+                            continue
+
+                        # Process posts for this channel
+                        for post in channel_posts:
+                            try:
+                                await self._process_single_post_with_config(post, config)
+                                await asyncio.sleep(2)  # Rate limiting
+
+                            except Exception as e:
+                                await self._handle_post_error(post, e)
 
                     except Exception as e:
                         logger.error(
-                            f"Failed to process post {post.id}",
+                            f"Failed to process channel {channel_id}",
                             error=str(e),
-                            post_id=post.post_id,
-                            channel_id=post.channel_id,
                             exc_info=True
-                        )
-
-                        # Mark as failed
-                        await self.queries.update_post_status(
-                            post.id,
-                            POST_STATUS["FAILED"]
-                        )
-
-                        await self.db_logger.error(
-                            "Post processing failed",
-                            post_id=post.id,
-                            post_url=post.post_url,
-                            error=str(e),
-                            error_type=type(e).__name__
                         )
 
             except Exception as e:
                 logger.error("Post processing job failed", error=str(e), exc_info=True)
 
-    async def process_single_post(self, post: Post):
-        """Process single post with universal logic"""
+    async def _get_channel_config(self, channel_id: int) -> Optional[Dict[str, Any]]:
+        """Get channel configuration with caching"""
+        # Check cache
+        if channel_id in self._channel_configs_cache:
+            cached_time, config = self._channel_configs_cache[channel_id]
+            if (datetime.utcnow() - cached_time).total_seconds() < self._cache_ttl:
+                return config
+
+        # Load from database
+        config = await self.queries.get_channel_with_full_config(channel_id)
+
+        if config:
+            # Cache it
+            self._channel_configs_cache[channel_id] = (datetime.utcnow(), config)
+
+            # Validate configuration
+            if not self._validate_channel_config(config):
+                logger.error(f"Invalid configuration for channel {channel_id}")
+                return None
+
+        return config
+
+    def _validate_channel_config(self, config: Dict[str, Any]) -> bool:
+        """Validate channel configuration completeness"""
+        required = ['channel', 'settings', 'templates']
+        return all(key in config and config[key] for key in required)
+
+    async def _process_single_post_with_config(
+        self,
+        post: Post,
+        config: Dict[str, Any]
+    ):
+        """Process single post with pre-loaded configuration"""
         logger.info(
             f"Processing post {post.post_id}",
             post_id=post.id,
@@ -84,7 +124,6 @@ class PostProcessor:
             url=post.post_url
         )
 
-        # Start transaction
         async with self.db.transaction() as conn:
             # Mark as processing
             await conn.execute(
@@ -98,142 +137,46 @@ class PostProcessor:
                 post.id
             )
 
-            # Get full channel configuration
-            config = await self.queries.get_channel_with_full_config(post.channel_id)
-            if not config:
-                raise Exception(f"No configuration found for channel {post.channel_id}")
-
+            # Extract configuration
             channel = config['channel']
             settings = config['settings']
-            reaction_services = config['reaction_services']
+            reaction_services = config.get('reaction_services', [])
             templates = config['templates']
 
-            # Validate configuration
+            # Validate before processing
             errors = validate_before_processing(post, settings, templates)
             if errors:
-                raise Exception(f"Validation failed: {'; '.join(errors)}")
-
-            # Validate channel
-            valid, error = DataValidator.validate_channel(channel)
-            if not valid:
-                raise Exception(f"Invalid channel: {error}")
-
-            # Validate settings
-            valid, error = DataValidator.validate_channel_settings(settings)
-            if not valid:
-                raise Exception(f"Invalid settings: {error}")
+                raise ValidationError(f"Validation failed: {'; '.join(errors)}")
 
             # Calculate quantities with randomization
             quantities = await self._calculate_quantities(settings)
 
-            logger.info(
-                "Calculated quantities",
+            # Log calculated quantities
+            await self.db_logger.info(
+                "Calculated quantities for post",
+                post_id=post.id,
                 channel=channel.channel_username,
                 views=quantities['views'],
                 reactions=quantities['reactions'],
                 reposts=quantities['reposts'],
-                reactions_randomized=settings.randomize_reactions,
-                reposts_randomized=settings.randomize_reposts
+                randomized={
+                    'reactions': settings.randomize_reactions,
+                    'reposts': settings.randomize_reposts
+                }
             )
 
-            # Load services dynamically
+            # Ensure service cache is fresh
             await self.queries.refresh_service_cache()
 
-            # Create orders for each service type
-            results = {
-                'views': None,
-                'reactions': None,
-                'reposts': None
-            }
-
             # Process each service type
-            if quantities['views'] > 0 and templates.get('views'):
-                results['views'] = await self._create_universal_order(
-                    post=post,
-                    settings=settings,
-                    service_type='views',
-                    quantity=quantities['views'],
-                    templates=templates['views'],
-                    delay_minutes=0
-                )
-
-            if quantities['reactions'] > 0 and templates.get('reactions'):
-                # Use reaction distribution if available
-                if reaction_services:
-                    results['reactions'] = await self._create_distributed_reactions_order(
-                        post=post,
-                        settings=settings,
-                        quantity=quantities['reactions'],
-                        templates=templates['reactions'],
-                        reaction_services=reaction_services
-                    )
-                else:
-                    # Fallback to single service
-                    results['reactions'] = await self._create_universal_order(
-                        post=post,
-                        settings=settings,
-                        service_type='reactions',
-                        quantity=quantities['reactions'],
-                        templates=templates['reactions'],
-                        delay_minutes=0
-                    )
-
-            if quantities['reposts'] > 0 and templates.get('reposts'):
-                results['reposts'] = await self._create_universal_order(
-                    post=post,
-                    settings=settings,
-                    service_type='reposts',
-                    quantity=quantities['reposts'],
-                    templates=templates['reposts'],
-                    delay_minutes=5  # Default delay for reposts
-                )
-
-            # Check if all orders were successful
-            success_count = sum(
-                1 for r in results.values()
-                if r and (r.get('success', False) or r.get('skipped', False))
+            results = await self._process_all_service_types(
+                post=post,
+                config=config,
+                quantities=quantities
             )
 
-            # Update post status
-            if success_count > 0:
-                await conn.execute(
-                    "UPDATE posts SET status = $1 WHERE id = $2",
-                    POST_STATUS["COMPLETED"],
-                    post.id
-                )
-
-                # Calculate total cost
-                total_cost = sum(
-                    r.get('total_cost', 0) for r in results.values()
-                    if r and r.get('success', False)
-                )
-
-                # Log success
-                await self.db_logger.info(
-                    "Post processed successfully",
-                    post_id=post.id,
-                    channel=channel.channel_username,
-                    post_url=post.post_url,
-                    views=quantities['views'],
-                    reactions=quantities['reactions'],
-                    reposts=quantities['reposts'],
-                    orders_created=success_count,
-                    total_cost=f"${total_cost:.2f}"
-                )
-            else:
-                # All orders failed
-                await conn.execute(
-                    "UPDATE posts SET status = $1 WHERE id = $2",
-                    POST_STATUS["FAILED"],
-                    post.id
-                )
-
-                failures = [k for k, v in results.items() if v and not v.get('success', False)]
-                logger.error(
-                    "All orders failed",
-                    post_id=post.id,
-                    failed_services=failures
-                )
+            # Update post status based on results
+            await self._update_post_status(conn, post, results)
 
     async def _calculate_quantities(self, settings: ChannelSettings) -> Dict[str, int]:
         """Calculate quantities with randomization"""
@@ -264,286 +207,356 @@ class PostProcessor:
             'reposts': reposts
         }
 
-    async def _create_universal_order(
+    async def _process_all_service_types(
         self,
         post: Post,
-        settings: ChannelSettings,
+        config: Dict[str, Any],
+        quantities: Dict[str, int]
+    ) -> Dict[str, Any]:
+        """Process all service types for a post"""
+        settings = config['settings']
+        templates = config['templates']
+        reaction_services = config.get('reaction_services', [])
+
+        results = {
+            'views': None,
+            'reactions': None,
+            'reposts': None
+        }
+
+        # Process views
+        if quantities['views'] > 0 and templates.get('views'):
+            results['views'] = await self._create_service_order(
+                post=post,
+                service_type='views',
+                quantity=quantities['views'],
+                templates=templates['views'],
+                service_id=settings.views_service_id,
+                delay_minutes=0
+            )
+
+        # Process reactions - special handling for multiple services
+        if quantities['reactions'] > 0:
+            if reaction_services and len(reaction_services) > 1:
+                # Multiple reaction types - distribute
+                results['reactions'] = await self._create_distributed_reactions(
+                    post=post,
+                    total_quantity=quantities['reactions'],
+                    reaction_services=reaction_services,
+                    templates=templates.get('reactions', [])
+                )
+            else:
+                # Single reaction service
+                results['reactions'] = await self._create_service_order(
+                    post=post,
+                    service_type='reactions',
+                    quantity=quantities['reactions'],
+                    templates=templates.get('reactions', []),
+                    service_id=settings.reactions_service_id,
+                    delay_minutes=0
+                )
+
+        # Process reposts
+        if quantities['reposts'] > 0 and templates.get('reposts'):
+            results['reposts'] = await self._create_service_order(
+                post=post,
+                service_type='reposts',
+                quantity=quantities['reposts'],
+                templates=templates['reposts'],
+                service_id=settings.reposts_service_id,
+                delay_minutes=5  # Default delay for reposts
+            )
+
+        return results
+
+    async def _create_service_order(
+        self,
+        post: Post,
         service_type: str,
         quantity: int,
         templates: List[PortionTemplate],
+        service_id: Optional[int] = None,
         delay_minutes: int = 0
     ) -> Dict[str, Any]:
-        """Create order with universal logic for any service type"""
+        """Create order for a service type"""
         if quantity <= 0:
-            return {'success': True, 'skipped': True}
+            return {'success': True, 'skipped': True, 'reason': 'Zero quantity'}
 
         try:
-            # Get service ID based on type
-            service_id = None
-            if service_type == 'views':
-                service_id = settings.views_service_id
-            elif service_type == 'reactions':
-                service_id = settings.reactions_service_id
-            elif service_type == 'reposts':
-                service_id = settings.reposts_service_id
-
+            # Get or find service
             if not service_id:
-                # Try to find best service dynamically
-                service = await self.queries.optimize_service_selection(service_type, quantity)
+                service = await self._find_best_service(service_type, quantity)
                 if not service:
-                    service = await self.queries.get_cheapest_service(service_type)
-                if not service:
-                    raise Exception(f"No service found for {service_type}")
+                    raise Exception(f"No suitable service found for {service_type}")
                 service_id = service.nakrutka_id
             else:
-                # Get service info
                 service = await self.queries.get_service(service_id)
                 if not service:
-                    raise Exception(f"Service {service_id} not found")
+                    # Try to find alternative
+                    logger.warning(f"Service {service_id} not found, finding alternative")
+                    service = await self._find_best_service(service_type, quantity)
+                    if not service:
+                        raise Exception(f"No service available for {service_type}")
+                    service_id = service.nakrutka_id
 
             # Validate and adjust quantity
-            if quantity < service.min_quantity:
-                logger.warning(
-                    f"{service_type} quantity {quantity} below minimum {service.min_quantity}",
-                    adjusting=True
+            adjusted_quantity = self._adjust_quantity_for_service(quantity, service)
+
+            if adjusted_quantity != quantity:
+                logger.info(
+                    f"Adjusted {service_type} quantity",
+                    original=quantity,
+                    adjusted=adjusted_quantity,
+                    service_limits=(service.min_quantity, service.max_quantity)
                 )
-                quantity = service.min_quantity
-            elif quantity > service.max_quantity:
-                logger.warning(
-                    f"{service_type} quantity {quantity} above maximum {service.max_quantity}",
-                    adjusting=True
-                )
-                quantity = service.max_quantity
 
             # Create order record
             order_id = await self.queries.create_order(
                 post_id=post.id,
                 service_type=service_type,
                 service_id=service_id,
-                total_quantity=quantity,
+                total_quantity=adjusted_quantity,
                 start_delay_minutes=delay_minutes
             )
 
-            # Calculate portions using templates
-            calculator = PortionCalculator(templates)
-            portions = calculator.calculate_portions(
-                total_quantity=quantity,
+            # Calculate portions
+            portions = await self._calculate_optimized_portions(
+                quantity=adjusted_quantity,
                 service=service,
-                start_time=datetime.utcnow() + timedelta(minutes=delay_minutes)
+                templates=templates,
+                delay_minutes=delay_minutes
             )
 
-            # Validate portions
-            valid, error = DataValidator.validate_portions(portions, quantity)
-            if not valid:
-                logger.warning(f"Portion validation: {error}")
-
-            # Convert to DB format
-            db_portions = [
-                {
-                    'order_id': order_id,
-                    'portion_number': p['portion_number'],
-                    'quantity_per_run': p['quantity_per_run'],
-                    'runs': p['runs'],
-                    'interval_minutes': p['interval_minutes'],
-                    'scheduled_at': p['scheduled_at']
-                }
-                for p in portions
-            ]
-
             # Save portions to database
-            await self.queries.create_portions(db_portions)
+            await self._save_portions(order_id, portions)
 
-            # Create orders in Nakrutka
-            nakrutka_results = await self._send_portions_to_nakrutka(
-                service_id=service_id,
+            # Send to Nakrutka
+            nakrutka_results = await self._send_to_nakrutka(
+                order_id=order_id,
+                service=service,
                 link=post.post_url,
                 portions=portions
             )
 
-            # Update order with Nakrutka ID
-            if nakrutka_results['success'] and nakrutka_results['orders']:
-                await self.queries.update_order_nakrutka_id(
-                    order_id,
-                    nakrutka_results['orders'][0]['order_id']
-                )
-
-                # Update portion IDs
-                for i, result in enumerate(nakrutka_results['orders']):
-                    if result['success']:
-                        await self.db.execute(
-                            """
-                            UPDATE order_portions 
-                            SET nakrutka_portion_id = $1, status = $2
-                            WHERE order_id = $3 AND portion_number = $4
-                            """,
-                            result['order_id'],
-                            PORTION_STATUS["RUNNING"],
-                            order_id,
-                            i + 1
-                        )
-
             # Calculate cost
-            cost = float(service.calculate_cost(quantity))
+            cost = float(service.calculate_cost(adjusted_quantity))
 
             logger.info(
                 f"{service_type.capitalize()} order created",
                 order_id=order_id,
                 service_id=service_id,
                 service_name=service.service_name,
-                quantity=quantity,
+                quantity=adjusted_quantity,
                 portions=len(portions),
                 cost=f"${cost:.2f}",
-                nakrutka_success=nakrutka_results['success']
+                nakrutka_success=nakrutka_results.get('success', False)
             )
 
             return {
                 'success': True,
                 'order_id': order_id,
                 'service_id': service_id,
-                'quantity': quantity,
+                'quantity': adjusted_quantity,
                 'cost': cost,
+                'portions': len(portions),
                 'nakrutka_results': nakrutka_results
             }
 
         except Exception as e:
-            logger.error(f"Failed to create {service_type} order", error=str(e), exc_info=True)
-            return {'success': False, 'error': str(e)}
+            logger.error(
+                f"Failed to create {service_type} order",
+                error=str(e),
+                post_id=post.id,
+                exc_info=True
+            )
+            return {
+                'success': False,
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
 
-    async def _create_distributed_reactions_order(
+    async def _create_distributed_reactions(
         self,
         post: Post,
-        settings: ChannelSettings,
-        quantity: int,
-        templates: List[PortionTemplate],
-        reaction_services: List[ChannelReactionService]
+        total_quantity: int,
+        reaction_services: List[ChannelReactionService],
+        templates: List[PortionTemplate]
     ) -> Dict[str, Any]:
         """Create multiple reaction orders based on distribution"""
-        if quantity <= 0:
+        if total_quantity <= 0:
             return {'success': True, 'skipped': True}
 
         try:
-            # Convert to distributor format
-            distributor_services = [
-                {
-                    'service_id': rs.service_id,
-                    'emoji': rs.emoji,
-                    'target_quantity': rs.target_quantity
-                }
-                for rs in reaction_services
-            ]
-
             # Calculate distribution
-            distributor = ReactionDistributor(distributor_services)
-            distributions = distributor.distribute_reactions(
-                total_quantity=quantity,
-                randomized=settings.randomize_reactions
-            )
+            distributor = ReactionDistributor(reaction_services)
+            distributions = distributor.distribute_reactions(total_quantity)
 
             all_results = []
-            total_cost = 0
+            total_cost = Decimal(0)
+            total_actual_quantity = 0
 
-            # Create separate order for each reaction type
+            # Create order for each reaction type
             for dist in distributions:
                 if dist['quantity'] <= 0:
                     continue
 
                 logger.info(
-                    f"Creating reaction order for {dist['emoji']}",
+                    f"Creating reaction order",
+                    emoji=dist['emoji'],
                     service_id=dist['service_id'],
                     quantity=dist['quantity'],
                     proportion=f"{dist['proportion']*100:.1f}%"
                 )
 
-                # Get service info
+                # Get service
                 service = await self.queries.get_service(dist['service_id'])
                 if not service:
-                    logger.warning(f"Service {dist['service_id']} not found, skipping")
+                    logger.warning(
+                        f"Service {dist['service_id']} not found",
+                        emoji=dist['emoji']
+                    )
                     continue
 
-                # Adjust quantity to service limits
-                service_quantity = dist['quantity']
-                if service_quantity < service.min_quantity:
-                    service_quantity = service.min_quantity
-                elif service_quantity > service.max_quantity:
-                    service_quantity = service.max_quantity
+                # Adjust quantity
+                adjusted_quantity = self._adjust_quantity_for_service(
+                    dist['quantity'],
+                    service
+                )
 
                 # Create order
-                order_id = await self.queries.create_order(
-                    post_id=post.id,
-                    service_type=SERVICE_TYPES["REACTIONS"],
+                result = await self._create_service_order(
+                    post=post,
+                    service_type='reactions',
+                    quantity=adjusted_quantity,
+                    templates=templates,
                     service_id=dist['service_id'],
-                    total_quantity=service_quantity,
-                    start_delay_minutes=0
+                    delay_minutes=0
                 )
 
-                # Calculate portions
-                calculator = PortionCalculator(templates)
-                portions = calculator.calculate_portions(
-                    total_quantity=service_quantity,
-                    service=service
-                )
-
-                # Save portions
-                db_portions = [
-                    {
-                        'order_id': order_id,
-                        'portion_number': p['portion_number'],
-                        'quantity_per_run': p['quantity_per_run'],
-                        'runs': p['runs'],
-                        'interval_minutes': p['interval_minutes'],
-                        'scheduled_at': p['scheduled_at']
-                    }
-                    for p in portions
-                ]
-                await self.queries.create_portions(db_portions)
-
-                # Send to Nakrutka
-                nakrutka_results = await self._send_portions_to_nakrutka(
-                    service_id=dist['service_id'],
-                    link=post.post_url,
-                    portions=portions
-                )
-
-                # Update order status
-                if nakrutka_results['success'] and nakrutka_results['orders']:
-                    await self.queries.update_order_nakrutka_id(
-                        order_id,
-                        nakrutka_results['orders'][0]['order_id']
-                    )
-
-                # Calculate cost
-                cost = float(service.calculate_cost(service_quantity))
-                total_cost += cost
+                if result['success']:
+                    total_cost += Decimal(str(result['cost']))
+                    total_actual_quantity += result['quantity']
 
                 all_results.append({
-                    'service_id': dist['service_id'],
+                    **result,
                     'emoji': dist['emoji'],
-                    'quantity': service_quantity,
-                    'order_id': order_id,
-                    'cost': cost,
-                    'success': nakrutka_results['success']
+                    'target_quantity': dist['quantity']
                 })
 
+            # Summary
+            success_count = sum(1 for r in all_results if r['success'])
+
             logger.info(
-                "Reaction orders created",
+                "Reaction orders completed",
                 total_orders=len(all_results),
-                total_quantity=quantity,
+                successful=success_count,
+                total_quantity=total_actual_quantity,
                 total_cost=f"${total_cost:.2f}"
             )
 
             return {
-                'success': all(r['success'] for r in all_results) if all_results else False,
+                'success': success_count > 0,
                 'orders': all_results,
-                'total_cost': total_cost
+                'total_cost': float(total_cost),
+                'total_quantity': total_actual_quantity,
+                'distribution_count': len(all_results)
             }
 
         except Exception as e:
-            logger.error("Failed to create distributed reactions", error=str(e), exc_info=True)
-            return {'success': False, 'error': str(e)}
+            logger.error(
+                "Failed to create distributed reactions",
+                error=str(e),
+                post_id=post.id,
+                exc_info=True
+            )
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
-    async def _send_portions_to_nakrutka(
+    async def _find_best_service(
         self,
-        service_id: int,
+        service_type: str,
+        quantity: int
+    ) -> Optional[Service]:
+        """Find best service for given type and quantity"""
+        # Try optimized selection first
+        service = await self.queries.optimize_service_selection(service_type, quantity)
+
+        if service:
+            return service
+
+        # Fallback to cheapest
+        service = await self.queries.get_cheapest_service(service_type)
+
+        if not service:
+            logger.error(f"No services available for {service_type}")
+
+        return service
+
+    def _adjust_quantity_for_service(self, quantity: int, service: Service) -> int:
+        """Adjust quantity to fit service limits"""
+        if quantity < service.min_quantity:
+            return service.min_quantity
+        elif quantity > service.max_quantity:
+            return service.max_quantity
+        return quantity
+
+    async def _calculate_optimized_portions(
+        self,
+        quantity: int,
+        service: Service,
+        templates: List[PortionTemplate],
+        delay_minutes: int
+    ) -> List[Dict[str, Any]]:
+        """Calculate optimized portions"""
+        if not templates:
+            # Use default distribution
+            return self._optimizer.calculate_default_portions(
+                quantity=quantity,
+                service=service,
+                delay_minutes=delay_minutes
+            )
+
+        # Use templates with optimization
+        calculator = PortionCalculator(templates)
+        portions = calculator.calculate_portions(
+            total_quantity=quantity,
+            service=service,
+            start_time=datetime.utcnow() + timedelta(minutes=delay_minutes)
+        )
+
+        # Optimize based on performance history
+        channel_id = templates[0].channel_id if templates else None
+        if channel_id:
+            portions = self._optimizer.optimize_portions(
+                portions=portions,
+                channel_id=channel_id,
+                service_type=service.service_type
+            )
+
+        return portions
+
+    async def _save_portions(self, order_id: int, portions: List[Dict[str, Any]]):
+        """Save portions to database"""
+        db_portions = [
+            {
+                'order_id': order_id,
+                'portion_number': p['portion_number'],
+                'quantity_per_run': p['quantity_per_run'],
+                'runs': p['runs'],
+                'interval_minutes': p['interval_minutes'],
+                'scheduled_at': p['scheduled_at']
+            }
+            for p in portions
+        ]
+
+        await self.queries.create_portions(db_portions)
+
+    async def _send_to_nakrutka(
+        self,
+        order_id: int,
+        service: Service,
         link: str,
         portions: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -551,66 +564,181 @@ class PostProcessor:
         results = []
         all_success = True
 
-        # Get service for validation
-        service = await self.queries.get_service(service_id)
-        if not service:
-            return {
-                'success': False,
-                'error': f"Service {service_id} not found",
-                'orders': []
-            }
-
-        # Create validator
-        validator = OrderValidator({service_id: service})
-
-        for portion in portions:
+        for i, portion in enumerate(portions):
             try:
-                # Validate order parameters
-                valid, error = validator.validate_order_params(
-                    service_id=service_id,
-                    quantity=portion['quantity_per_run'] * portion['runs'],
-                    link=link
+                # Validate before sending
+                validation = await self.nakrutka.validate_service_params(
+                    service_id=service.nakrutka_id,
+                    quantity=portion['quantity_per_run'] * portion['runs']
                 )
-                if not valid:
-                    raise Exception(error)
 
-                # Create order in Nakrutka
+                if not validation['valid']:
+                    raise ValidationError(validation.get('error', 'Invalid parameters'))
+
+                # Create order
                 result = await self.nakrutka.create_order(
-                    service_id=service_id,
+                    service_id=service.nakrutka_id,
                     link=link,
                     quantity=portion['quantity_per_run'],
                     runs=portion['runs'],
                     interval=portion['interval_minutes']
                 )
 
+                # Update portion with Nakrutka ID
+                await self.db.execute(
+                    """
+                    UPDATE order_portions 
+                    SET nakrutka_portion_id = $1, status = $2, started_at = $3
+                    WHERE order_id = $4 AND portion_number = $5
+                    """,
+                    result.get('order'),
+                    PORTION_STATUS["RUNNING"],
+                    datetime.utcnow(),
+                    order_id,
+                    portion['portion_number']
+                )
+
                 results.append({
                     'portion_number': portion['portion_number'],
                     'order_id': result.get('order'),
                     'success': True,
-                    'charge': result.get('charge'),
-                    'currency': result.get('currency'),
-                    'total_quantity': portion['total_quantity']
+                    'charge': result.get('charge')
                 })
+
+                # Update main order with first Nakrutka ID
+                if i == 0:
+                    await self.queries.update_order_nakrutka_id(
+                        order_id,
+                        result.get('order')
+                    )
 
             except Exception as e:
                 logger.error(
                     f"Failed to create portion {portion['portion_number']}",
                     error=str(e),
-                    service_id=service_id,
-                    quantity=portion['quantity_per_run'],
-                    runs=portion['runs']
+                    order_id=order_id,
+                    service_id=service.nakrutka_id
                 )
+
                 results.append({
                     'portion_number': portion['portion_number'],
                     'success': False,
                     'error': str(e)
                 })
+
                 all_success = False
+
+                # Determine if we should continue
+                if ErrorRecovery.should_retry_error(e):
+                    # Temporary error, continue with other portions
+                    continue
+                else:
+                    # Permanent error, stop
+                    break
 
         return {
             'success': all_success,
+            'partial_success': len([r for r in results if r['success']]) > 0,
             'orders': results
         }
+
+    async def _update_post_status(
+        self,
+        conn,
+        post: Post,
+        results: Dict[str, Any]
+    ):
+        """Update post status based on processing results"""
+        # Count successes
+        success_count = sum(
+            1 for r in results.values()
+            if r and (r.get('success') or r.get('skipped'))
+        )
+
+        # Calculate total cost
+        total_cost = sum(
+            r.get('cost', 0) for r in results.values()
+            if r and r.get('success')
+        )
+
+        if success_count > 0:
+            # At least partial success
+            status = POST_STATUS["COMPLETED"]
+
+            await self.db_logger.info(
+                "Post processed",
+                post_id=post.id,
+                post_url=post.post_url,
+                success_count=success_count,
+                total_cost=f"${total_cost:.2f}",
+                results={
+                    k: {
+                        'success': v.get('success', False),
+                        'quantity': v.get('quantity', 0),
+                        'cost': v.get('cost', 0)
+                    }
+                    for k, v in results.items() if v
+                }
+            )
+        else:
+            # Complete failure
+            status = POST_STATUS["FAILED"]
+
+            await self.db_logger.error(
+                "Post processing failed",
+                post_id=post.id,
+                errors={
+                    k: v.get('error', 'Unknown error')
+                    for k, v in results.items()
+                    if v and not v.get('success')
+                }
+            )
+
+        await conn.execute(
+            "UPDATE posts SET status = $1 WHERE id = $2",
+            status,
+            post.id
+        )
+
+    async def _handle_post_error(self, post: Post, error: Exception):
+        """Handle post processing error"""
+        error_category = ErrorRecovery.categorize_error(error)
+
+        logger.error(
+            f"Post processing error",
+            post_id=post.id,
+            error=str(error),
+            category=error_category,
+            exc_info=True
+        )
+
+        # Update post status
+        await self.queries.update_post_status(post.id, POST_STATUS["FAILED"])
+
+        # Log to database
+        await self.db_logger.error(
+            "Post processing failed",
+            post_id=post.id,
+            post_url=post.post_url,
+            error=str(error),
+            error_type=type(error).__name__,
+            error_category=error_category
+        )
+
+        # Determine if we should retry later
+        if ErrorRecovery.should_retry_error(error):
+            # Schedule for retry
+            await self._schedule_retry(post, error_category)
+
+    async def _schedule_retry(self, post: Post, error_category: str):
+        """Schedule post for retry"""
+        # This would integrate with a retry queue
+        # For now, just log
+        logger.info(
+            f"Post scheduled for retry",
+            post_id=post.id,
+            error_category=error_category
+        )
 
     async def check_order_status(self):
         """Check status of active orders"""
@@ -622,7 +750,7 @@ class PostProcessor:
 
             logger.info(f"Checking status of {len(active_orders)} orders")
 
-            # Group by Nakrutka order ID
+            # Group by Nakrutka order ID for batch checking
             nakrutka_ids = [
                 order.nakrutka_order_id
                 for order in active_orders
@@ -632,69 +760,11 @@ class PostProcessor:
             if not nakrutka_ids:
                 return
 
-            # Get statuses from Nakrutka in batches
+            # Get statuses in batches
             batch_size = 100
             for i in range(0, len(nakrutka_ids), batch_size):
                 batch = nakrutka_ids[i:i + batch_size]
-
-                try:
-                    statuses = await self.nakrutka.get_multiple_status(batch)
-
-                    # Update order statuses
-                    for order in active_orders:
-                        if not order.nakrutka_order_id or order.nakrutka_order_id not in statuses:
-                            continue
-
-                        status_info = statuses.get(order.nakrutka_order_id, {})
-                        nakrutka_status = status_info.get('status', '').lower()
-
-                        if nakrutka_status == 'completed':
-                            await self.queries.update_order_status(
-                                order.id,
-                                ORDER_STATUS["COMPLETED"],
-                                datetime.utcnow()
-                            )
-
-                            logger.info(
-                                f"Order {order.id} completed",
-                                nakrutka_id=order.nakrutka_order_id,
-                                charge=status_info.get('charge'),
-                                start_count=status_info.get('start_count'),
-                                remains=status_info.get('remains')
-                            )
-
-                        elif nakrutka_status in ['canceled', 'cancelled']:
-                            await self.queries.update_order_status(
-                                order.id,
-                                ORDER_STATUS["CANCELLED"],
-                                datetime.utcnow()
-                            )
-
-                            logger.warning(
-                                f"Order {order.id} cancelled",
-                                nakrutka_id=order.nakrutka_order_id
-                            )
-
-                            await self.db_logger.warning(
-                                "Order cancelled by Nakrutka",
-                                order_id=order.id,
-                                nakrutka_id=order.nakrutka_order_id,
-                                reason=status_info.get('error', 'Unknown')
-                            )
-
-                        elif nakrutka_status == 'partial':
-                            # Partial completion
-                            logger.warning(
-                                f"Order {order.id} partially completed",
-                                nakrutka_id=order.nakrutka_order_id,
-                                remains=status_info.get('remains')
-                            )
-
-                except Exception as e:
-                    logger.error(
-                        f"Failed to check batch of {len(batch)} orders",
-                        error=str(e)
-                    )
+                await self._check_batch_status(batch, active_orders)
 
             # Check portion statuses
             await self._check_portion_statuses()
@@ -702,10 +772,99 @@ class PostProcessor:
         except Exception as e:
             logger.error("Status check failed", error=str(e), exc_info=True)
 
+    async def _check_batch_status(
+        self,
+        batch: List[str],
+        active_orders: List[Order]
+    ):
+        """Check status for a batch of orders"""
+        try:
+            statuses = await self.nakrutka.get_multiple_status(batch)
+
+            for order in active_orders:
+                if not order.nakrutka_order_id or order.nakrutka_order_id not in statuses:
+                    continue
+
+                status_info = statuses.get(order.nakrutka_order_id, {})
+                await self._process_order_status_update(order, status_info)
+
+        except Exception as e:
+            logger.error(
+                f"Failed to check batch status",
+                error=str(e),
+                batch_size=len(batch)
+            )
+
+    async def _process_order_status_update(
+        self,
+        order: Order,
+        status_info: Dict[str, Any]
+    ):
+        """Process status update for an order"""
+        nakrutka_status = status_info.get('status', '').lower()
+
+        if nakrutka_status == 'completed':
+            await self.queries.update_order_status(
+                order.id,
+                ORDER_STATUS["COMPLETED"],
+                datetime.utcnow()
+            )
+
+            # Record performance
+            await self._record_order_performance(order, status_info)
+
+        elif nakrutka_status in ['canceled', 'cancelled']:
+            await self.queries.update_order_status(
+                order.id,
+                ORDER_STATUS["CANCELLED"],
+                datetime.utcnow()
+            )
+
+            await self.db_logger.warning(
+                "Order cancelled",
+                order_id=order.id,
+                nakrutka_id=order.nakrutka_order_id,
+                reason=status_info.get('error', 'Unknown')
+            )
+
+        elif nakrutka_status == 'partial':
+            logger.warning(
+                f"Order partially completed",
+                order_id=order.id,
+                remains=status_info.get('remains')
+            )
+
+    async def _record_order_performance(
+        self,
+        order: Order,
+        status_info: Dict[str, Any]
+    ):
+        """Record order performance for optimization"""
+        try:
+            # Get post and channel info
+            post = await self.queries.get_post_by_id(order.post_id)
+            if not post:
+                return
+
+            # Calculate completion time
+            if order.started_at:
+                completion_time = datetime.utcnow() - order.started_at
+
+                # Record in optimizer
+                self._optimizer.record_performance(
+                    channel_id=post.channel_id,
+                    service_type=order.service_type,
+                    order_id=order.id,
+                    completion_time=completion_time.total_seconds(),
+                    charge=status_info.get('charge', 0)
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to record performance: {e}")
+
     async def _check_portion_statuses(self):
         """Check and update portion statuses"""
         try:
-            # Get running portions
             running_portions = await self.db.fetch(
                 """
                 SELECT op.*, o.nakrutka_order_id 
@@ -713,14 +872,11 @@ class PostProcessor:
                 JOIN orders o ON o.id = op.order_id
                 WHERE op.status = $1 
                 AND op.nakrutka_portion_id IS NOT NULL
+                LIMIT 100
                 """,
                 PORTION_STATUS["RUNNING"]
             )
 
-            if not running_portions:
-                return
-
-            # Check each portion
             for portion in running_portions:
                 try:
                     status = await self.nakrutka.get_order_status(
@@ -739,11 +895,6 @@ class PostProcessor:
                             portion['id']
                         )
 
-                        logger.debug(
-                            f"Portion {portion['id']} completed",
-                            portion_number=portion['portion_number']
-                        )
-
                 except Exception as e:
                     logger.error(
                         f"Failed to check portion {portion['id']}",
@@ -756,49 +907,64 @@ class PostProcessor:
     async def retry_failed_orders(self, hours: int = 24):
         """Retry recently failed orders"""
         try:
-            # Get failed posts
             failed_posts = await self.queries.get_recent_failed_posts(hours)
 
             if not failed_posts:
                 logger.info("No failed posts to retry")
                 return
 
-            logger.info(f"Retrying {len(failed_posts)} failed posts")
+            logger.info(f"Found {len(failed_posts)} failed posts to retry")
 
+            retry_count = 0
             for post in failed_posts:
-                try:
-                    # Reset status to new
+                # Check if should retry
+                if await self._should_retry_post(post):
                     await self.queries.update_post_status(
                         post.id,
                         POST_STATUS["NEW"]
                     )
+                    retry_count += 1
 
-                    # Will be picked up by next processing cycle
-                    logger.info(f"Reset post {post.id} for retry")
-
-                except Exception as e:
-                    logger.error(f"Failed to reset post {post.id}: {e}")
+            logger.info(f"Reset {retry_count} posts for retry")
 
         except Exception as e:
             logger.error(f"Failed to retry orders: {e}")
+
+    async def _should_retry_post(self, post: Post) -> bool:
+        """Determine if post should be retried"""
+        # Check post age
+        age = datetime.utcnow() - post.created_at
+        if age.days > 2:
+            return False  # Too old
+
+        # Check retry count (would need to track this)
+        # For now, always retry if within age limit
+        return True
 
     async def get_processing_stats(self) -> Dict[str, Any]:
         """Get current processing statistics"""
         try:
             stats = await self.queries.get_monitoring_stats()
 
-            # Add processing-specific stats
-            processing_stats = {
+            # Add optimizer stats
+            optimizer_stats = self._optimizer.get_stats()
+
+            return {
                 'posts_processing': stats.get('processing_posts', 0),
                 'active_orders': stats.get('active_orders', 0),
                 'posts_24h': stats.get('posts_24h', 0),
                 'orders_24h': stats.get('orders_24h', 0),
                 'cost_today': stats.get('cost_today', 0),
-                'active_channels': stats.get('active_channels', 0)
+                'active_channels': stats.get('active_channels', 0),
+                'cache_size': len(self._channel_configs_cache),
+                'optimizer_stats': optimizer_stats
             }
-
-            return processing_stats
 
         except Exception as e:
             logger.error(f"Failed to get processing stats: {e}")
             return {}
+
+    def clear_cache(self):
+        """Clear channel configuration cache"""
+        self._channel_configs_cache.clear()
+        logger.info("Channel configuration cache cleared")

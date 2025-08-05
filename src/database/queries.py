@@ -1,10 +1,11 @@
 """
-Database queries - Enhanced with dynamic service loading
+Database queries - Enhanced with proper reaction services handling
 """
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
 from decimal import Decimal
+import asyncio
 
 from src.database.connection import DatabaseConnection
 from src.database.models import *
@@ -15,11 +16,13 @@ logger = get_logger(__name__)
 
 
 class Queries:
-    """Enhanced database queries with caching and dynamic services"""
+    """Enhanced database queries with universal channel support"""
 
     def __init__(self, db: DatabaseConnection):
         self.db = db
         self._service_cache = ServiceCache()
+        self._channel_config_cache: Dict[int, ChannelConfig] = {}
+        self._cache_ttl = 300  # 5 minutes
 
     # ============ CHANNELS ============
 
@@ -45,22 +48,50 @@ class Queries:
         row = await self.db.fetchrow(query, channel_id)
         return Channel.from_db_row(dict(row)) if row else None
 
-    async def get_channel_with_full_config(self, channel_id: int) -> Optional[Dict[str, Any]]:
-        """Get channel with all related configuration"""
+    async def get_channel_config(self, channel_id: int, use_cache: bool = True) -> Optional[ChannelConfig]:
+        """Get complete channel configuration with caching"""
+        # Check cache
+        if use_cache and channel_id in self._channel_config_cache:
+            cached_config = self._channel_config_cache[channel_id]
+            # Simple TTL check could be added here
+            return cached_config
+
+        # Get channel
         channel = await self.get_channel_by_id(channel_id)
         if not channel:
             return None
 
-        settings = await self.get_channel_settings(channel_id)
-        reaction_services = await self.get_reaction_services(channel_id)
-        templates = await self.get_all_portion_templates(channel_id)
+        # Get all related data in parallel
+        settings_task = self.get_channel_settings(channel_id)
+        reaction_services_task = self.get_reaction_services_with_details(channel_id)
+        templates_task = self.get_all_portion_templates(channel_id)
 
-        return {
-            'channel': channel,
-            'settings': settings,
-            'reaction_services': reaction_services,
-            'templates': templates
-        }
+        settings, reaction_services, templates = await asyncio.gather(
+            settings_task,
+            reaction_services_task,
+            templates_task
+        )
+
+        if not settings:
+            logger.warning(f"No settings found for channel {channel_id}")
+            return None
+
+        # Create config object
+        config = ChannelConfig(
+            channel=channel,
+            settings=settings,
+            reaction_services=reaction_services,
+            portion_templates=templates
+        )
+
+        # Cache it
+        self._channel_config_cache[channel_id] = config
+
+        return config
+
+    async def invalidate_channel_cache(self, channel_id: int):
+        """Invalidate channel configuration cache"""
+        self._channel_config_cache.pop(channel_id, None)
 
     # ============ CHANNEL SETTINGS ============
 
@@ -68,25 +99,81 @@ class Queries:
         """Get channel settings with proper model"""
         query = "SELECT * FROM channel_settings WHERE channel_id = $1"
         row = await self.db.fetchrow(query, channel_id)
-        return ChannelSettings.from_db_row(dict(row)) if row else None
+
+        if not row:
+            return None
+
+        settings = ChannelSettings.from_db_row(dict(row))
+
+        # Load reaction distribution from channel_reaction_services if needed
+        if settings.reactions_target > 0 and not settings._reaction_distribution:
+            reaction_services = await self.get_reaction_services(channel_id)
+            if reaction_services:
+                settings._reaction_distribution = [
+                    {
+                        'service_id': rs.service_id,
+                        'emoji': rs.emoji,
+                        'quantity': rs.target_quantity
+                    }
+                    for rs in reaction_services
+                ]
+
+        return settings
 
     async def get_reaction_services(self, channel_id: int) -> List[ChannelReactionService]:
         """Get reaction services for channel"""
         query = """
-            SELECT crs.*, s.service_name 
+            SELECT * FROM channel_reaction_services
+            WHERE channel_id = $1
+            ORDER BY id
+        """
+        rows = await self.db.fetch(query, channel_id)
+        return [ChannelReactionService.from_db_row(dict(row)) for row in rows]
+
+    async def get_reaction_services_with_details(self, channel_id: int) -> List[ChannelReactionService]:
+        """Get reaction services with service details"""
+        query = """
+            SELECT 
+                crs.*,
+                s.service_name,
+                s.price_per_1000,
+                s.min_quantity,
+                s.max_quantity,
+                s.is_active as service_active
             FROM channel_reaction_services crs
             LEFT JOIN services s ON s.nakrutka_id = crs.service_id
             WHERE crs.channel_id = $1
             ORDER BY crs.id
         """
         rows = await self.db.fetch(query, channel_id)
-        return [ChannelReactionService.from_db_row(dict(row)) for row in rows]
 
-    async def update_channel_settings(
-        self,
-        channel_id: int,
-        **kwargs
-    ) -> bool:
+        reaction_services = []
+        for row in rows:
+            rs_data = {k: v for k, v in dict(row).items()
+                      if k in ChannelReactionService.__annotations__}
+            rs = ChannelReactionService.from_db_row(rs_data)
+
+            # Set service details if available
+            if row.get('service_name'):
+                service_data = {
+                    'id': 0,  # Placeholder
+                    'nakrutka_id': rs.service_id,
+                    'service_name': row['service_name'],
+                    'service_type': 'reactions',
+                    'price_per_1000': row['price_per_1000'],
+                    'min_quantity': row['min_quantity'],
+                    'max_quantity': row['max_quantity'],
+                    'is_active': row['service_active'],
+                    'updated_at': datetime.utcnow()
+                }
+                service = Service.from_db_row(service_data)
+                rs.set_service(service)
+
+            reaction_services.append(rs)
+
+        return reaction_services
+
+    async def update_channel_settings(self, channel_id: int, **kwargs) -> bool:
         """Update channel settings dynamically"""
         if not kwargs:
             return False
@@ -107,9 +194,45 @@ class Queries:
 
         try:
             await self.db.execute(query, *values)
+            await self.invalidate_channel_cache(channel_id)
             return True
         except Exception as e:
             logger.error(f"Failed to update channel settings: {e}")
+            return False
+
+    async def update_reaction_services(
+        self,
+        channel_id: int,
+        reaction_distribution: List[Dict[str, Any]]
+    ) -> bool:
+        """Update reaction services for channel"""
+        try:
+            async with self.db.transaction() as conn:
+                # Delete existing
+                await conn.execute(
+                    "DELETE FROM channel_reaction_services WHERE channel_id = $1",
+                    channel_id
+                )
+
+                # Insert new
+                for dist in reaction_distribution:
+                    await conn.execute(
+                        """
+                        INSERT INTO channel_reaction_services 
+                        (channel_id, service_id, emoji, target_quantity)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        channel_id,
+                        dist['service_id'],
+                        dist.get('emoji', 'unknown'),
+                        dist['quantity']
+                    )
+
+                await self.invalidate_channel_cache(channel_id)
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to update reaction services: {e}")
             return False
 
     # ============ POSTS ============
@@ -148,9 +271,9 @@ class Queries:
         return result
 
     async def get_new_posts(self, limit: int = 10) -> List[Post]:
-        """Get posts with 'new' status"""
+        """Get posts with 'new' status from active channels"""
         query = """
-            SELECT p.*, c.channel_username 
+            SELECT p.* 
             FROM posts p
             JOIN channels c ON c.id = p.channel_id
             WHERE p.status = $1
@@ -186,11 +309,12 @@ class Queries:
         return Post.from_db_row(dict(row)) if row else None
 
     async def get_recent_failed_posts(self, hours: int = 24) -> List[Post]:
-        """Get recently failed posts"""
+        """Get recently failed posts that can be retried"""
         query = """
             SELECT * FROM posts
             WHERE status = 'failed'
             AND created_at > NOW() - INTERVAL '%s hours'
+            AND published_at > NOW() - INTERVAL '48 hours'
             ORDER BY created_at DESC
         """
         rows = await self.db.fetch(query % hours)
@@ -224,6 +348,37 @@ class Queries:
             start_delay_minutes,
             ORDER_STATUS["PENDING"]
         )
+        return order_id
+
+    async def create_order_with_validation(
+        self,
+        request: OrderRequest
+    ) -> Optional[int]:
+        """Create order with validation"""
+        # Validate request
+        if not request.is_valid():
+            logger.error(
+                "Invalid order request",
+                errors=request.get_validation_errors()
+            )
+            return None
+
+        # Use adjusted quantity if available
+        quantity = request.get_final_quantity()
+
+        # Create order
+        order_id = await self.create_order(
+            post_id=request.post_id,
+            service_type=request.service_type.value,
+            service_id=request.service_id,
+            total_quantity=quantity,
+            start_delay_minutes=request.start_delay_minutes
+        )
+
+        # Create portions
+        if order_id and request.portions:
+            await self.create_portions_batch(order_id, request.portions)
+
         return order_id
 
     async def update_order_nakrutka_id(self, order_id: int, nakrutka_id: str):
@@ -267,9 +422,11 @@ class Queries:
         self,
         order_id: int,
         status: str,
-        completed_at: Optional[datetime] = None
+        completed_at: Optional[datetime] = None,
+        actual_quantity: Optional[int] = None,
+        cost: Optional[Decimal] = None
     ):
-        """Update order status"""
+        """Update order status with additional info"""
         if completed_at:
             query = """
                 UPDATE orders 
@@ -281,6 +438,9 @@ class Queries:
             query = "UPDATE orders SET status = $1 WHERE id = $2"
             await self.db.execute(query, status, order_id)
 
+        # Store additional metadata if needed
+        # Could add columns for actual_quantity and cost
+
     async def get_orders_for_post(self, post_id: int) -> List[Order]:
         """Get all orders for a post"""
         query = """
@@ -289,6 +449,29 @@ class Queries:
             ORDER BY service_type
         """
         rows = await self.db.fetch(query, post_id)
+        return [Order.from_db_row(dict(row)) for row in rows]
+
+    async def get_order_history(
+        self,
+        channel_id: int,
+        days: int = 30,
+        service_type: Optional[str] = None
+    ) -> List[Order]:
+        """Get order history for channel"""
+        query = """
+            SELECT o.* 
+            FROM orders o
+            JOIN posts p ON p.id = o.post_id
+            WHERE p.channel_id = $1
+            AND o.created_at > NOW() - INTERVAL '%s days'
+        """
+
+        if service_type:
+            query += " AND o.service_type = $2"
+            rows = await self.db.fetch(query % days, channel_id, service_type)
+        else:
+            rows = await self.db.fetch(query % days, channel_id)
+
         return [Order.from_db_row(dict(row)) for row in rows]
 
     # ============ PORTIONS ============
@@ -315,13 +498,24 @@ class Queries:
                 p['runs'],
                 p['interval_minutes'],
                 PORTION_STATUS["WAITING"],
-                p['scheduled_at']
+                p.get('scheduled_at')
             )
             for p in portions
         ]
 
         # Bulk insert
         await self.db.executemany(query, data)
+
+    async def create_portions_batch(self, order_id: int, portions: List[Dict[str, Any]]):
+        """Create portions for a single order"""
+        if not portions:
+            return
+
+        # Add order_id to each portion
+        for portion in portions:
+            portion['order_id'] = order_id
+
+        await self.create_portions(portions)
 
     async def get_order_portions(self, order_id: int) -> List[OrderPortion]:
         """Get portions for order"""
@@ -350,26 +544,39 @@ class Queries:
                 query, status, nakrutka_id, datetime.utcnow(), portion_id
             )
         else:
-            query = "UPDATE order_portions SET status = $1 WHERE id = $2"
-            await self.db.execute(query, status, portion_id)
+            if status == PORTION_STATUS["COMPLETED"]:
+                query = """
+                    UPDATE order_portions 
+                    SET status = $1, completed_at = $2
+                    WHERE id = $3
+                """
+                await self.db.execute(query, status, datetime.utcnow(), portion_id)
+            else:
+                query = "UPDATE order_portions SET status = $1 WHERE id = $2"
+                await self.db.execute(query, status, portion_id)
 
     async def get_scheduled_portions(self) -> List[OrderPortion]:
         """Get portions ready to be executed"""
         query = """
-            SELECT * FROM order_portions
-            WHERE status = $1 
-            AND scheduled_at <= $2
-            ORDER BY scheduled_at
+            SELECT op.* 
+            FROM order_portions op
+            JOIN orders o ON o.id = op.order_id
+            WHERE op.status = $1 
+            AND (op.scheduled_at IS NULL OR op.scheduled_at <= $2)
+            AND o.status IN ($3, $4)
+            ORDER BY op.scheduled_at
             LIMIT 50
         """
         rows = await self.db.fetch(
             query,
             PORTION_STATUS["WAITING"],
-            datetime.utcnow()
+            datetime.utcnow(),
+            ORDER_STATUS["PENDING"],
+            ORDER_STATUS["IN_PROGRESS"]
         )
         return [OrderPortion.from_db_row(dict(row)) for row in rows]
 
-    # ============ SERVICES (DYNAMIC) ============
+    # ============ SERVICES (ENHANCED) ============
 
     async def refresh_service_cache(self) -> Dict[int, Service]:
         """Refresh service cache from database"""
@@ -377,15 +584,35 @@ class Queries:
             return self._service_cache.services
 
         query = """
-            SELECT * FROM services 
-            WHERE is_active = true
-            ORDER BY service_type, price_per_1000
+            WITH service_stats AS (
+                SELECT 
+                    service_id,
+                    COUNT(*) FILTER (WHERE status = 'completed') as completed_count,
+                    COUNT(*) as total_count
+                FROM orders
+                WHERE created_at > NOW() - INTERVAL '30 days'
+                GROUP BY service_id
+            )
+            SELECT 
+                s.*,
+                COALESCE(ss.completed_count, 0) as completed_orders,
+                COALESCE(ss.total_count, 0) as total_orders
+            FROM services s
+            LEFT JOIN service_stats ss ON ss.service_id = s.nakrutka_id
+            WHERE s.is_active = true
+            ORDER BY s.service_type, s.price_per_1000
         """
         rows = await self.db.fetch(query)
 
         self._service_cache.clear()
         for row in rows:
             service = Service.from_db_row(dict(row))
+
+            # Calculate performance score
+            if row['total_orders'] > 0:
+                success_rate = row['completed_orders'] / row['total_orders']
+                service.set_performance_score(success_rate)
+
             self._service_cache.add_service(service)
 
         logger.info(f"Refreshed service cache with {len(rows)} services")
@@ -441,6 +668,58 @@ class Queries:
                 return service
 
         return None
+
+    async def find_best_service(
+        self,
+        service_type: str,
+        quantity: int,
+        preferred_features: Optional[List[str]] = None
+    ) -> Optional[Service]:
+        """Find best service based on multiple criteria"""
+        services = await self.get_services_by_type(service_type)
+        if not services:
+            return None
+
+        # Filter by quantity limits
+        valid_services = [
+            s for s in services
+            if s.validate_quantity(quantity)
+        ]
+
+        if not valid_services:
+            # Adjust quantity and try again
+            valid_services = [
+                s for s in services
+                if quantity >= s.min_quantity
+            ]
+
+        if not valid_services:
+            return None
+
+        # Score services
+        scored_services = []
+        for service in valid_services:
+            score = service.get_performance_score() * 0.5  # Base performance
+
+            # Price score (lower is better)
+            min_price = min(s.price_per_1000 for s in valid_services)
+            price_score = float(min_price) / float(service.price_per_1000)
+            score += price_score * 0.3
+
+            # Feature matching
+            if preferred_features:
+                feature_score = 0
+                for feature in preferred_features:
+                    if feature.lower() in service.service_name.lower():
+                        feature_score += 0.1
+                score += min(feature_score, 0.2)
+
+            scored_services.append((service, score))
+
+        # Sort by score
+        scored_services.sort(key=lambda x: x[1], reverse=True)
+
+        return scored_services[0][0] if scored_services else None
 
     # ============ PORTION TEMPLATES ============
 
@@ -513,6 +792,40 @@ class Queries:
         for template in templates:
             await self.db.execute(query, channel_id, *template)
 
+    async def update_portion_template(
+        self,
+        channel_id: int,
+        service_type: str,
+        portion_number: int,
+        **updates
+    ) -> bool:
+        """Update specific portion template"""
+        if not updates:
+            return False
+
+        set_clauses = []
+        values = []
+        for i, (key, value) in enumerate(updates.items(), 1):
+            set_clauses.append(f"{key} = ${i}")
+            values.append(value)
+
+        query = f"""
+            UPDATE portion_templates
+            SET {', '.join(set_clauses)}
+            WHERE channel_id = ${len(values) + 1}
+            AND service_type = ${len(values) + 2}
+            AND portion_number = ${len(values) + 3}
+        """
+        values.extend([channel_id, service_type, portion_number])
+
+        try:
+            result = await self.db.execute(query, *values)
+            await self.invalidate_channel_cache(channel_id)
+            return result == "UPDATE 1"
+        except Exception as e:
+            logger.error(f"Failed to update portion template: {e}")
+            return False
+
     # ============ API KEYS ============
 
     async def get_api_key(self, service_name: str) -> Optional[str]:
@@ -527,11 +840,12 @@ class Queries:
     async def update_api_key(self, service_name: str, api_key: str):
         """Update API key"""
         query = """
-            UPDATE api_keys 
-            SET api_key = $1, created_at = $2
-            WHERE service_name = $3
+            INSERT INTO api_keys (service_name, api_key, is_active)
+            VALUES ($1, $2, true)
+            ON CONFLICT (service_name) 
+            DO UPDATE SET api_key = $2, created_at = $3
         """
-        await self.db.execute(query, api_key, datetime.utcnow(), service_name)
+        await self.db.execute(query, service_name, api_key, datetime.utcnow())
 
     # ============ LOGS ============
 
@@ -546,25 +860,28 @@ class Queries:
     async def get_recent_logs(
         self,
         level: Optional[str] = None,
-        limit: int = 100
+        limit: int = 100,
+        channel_id: Optional[int] = None
     ) -> List[Log]:
-        """Get recent logs"""
-        if level:
-            query = """
-                SELECT * FROM logs 
-                WHERE level = $1
-                ORDER BY created_at DESC
-                LIMIT $2
-            """
-            rows = await self.db.fetch(query, level, limit)
-        else:
-            query = """
-                SELECT * FROM logs 
-                ORDER BY created_at DESC
-                LIMIT $1
-            """
-            rows = await self.db.fetch(query, limit)
+        """Get recent logs with filters"""
+        query = "SELECT * FROM logs WHERE 1=1"
+        params = []
+        param_count = 0
 
+        if level:
+            param_count += 1
+            query += f" AND level = ${param_count}"
+            params.append(level)
+
+        if channel_id:
+            param_count += 1
+            query += f" AND context->>'channel_id' = ${param_count}::text"
+            params.append(str(channel_id))
+
+        query += f" ORDER BY created_at DESC LIMIT ${param_count + 1}"
+        params.append(limit)
+
+        rows = await self.db.fetch(query, *params)
         return [Log.from_db_row(dict(row)) for row in rows]
 
     async def cleanup_old_logs(self, days: int = 7) -> int:
@@ -577,10 +894,10 @@ class Queries:
         result = await self.db.fetch(query % days)
         return len(result)
 
-    # ============ STATISTICS ============
+    # ============ STATISTICS (ENHANCED) ============
 
-    async def get_channel_stats(self, channel_id: int) -> Dict[str, Any]:
-        """Get channel statistics"""
+    async def get_channel_stats(self, channel_id: int) -> ChannelStats:
+        """Get comprehensive channel statistics"""
         query = """
             WITH post_stats AS (
                 SELECT 
@@ -589,7 +906,8 @@ class Queries:
                     COUNT(CASE WHEN status = 'processing' THEN 1 END) as processing_posts,
                     COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_posts,
                     COUNT(CASE WHEN created_at > NOW() - INTERVAL '24 hours' THEN 1 END) as posts_24h,
-                    COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as posts_7d
+                    COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as posts_7d,
+                    MAX(created_at) as last_post_date
                 FROM posts
                 WHERE channel_id = $1
             ),
@@ -598,15 +916,89 @@ class Queries:
                     COUNT(DISTINCT o.id) as total_orders,
                     SUM(o.total_quantity) FILTER (WHERE o.service_type = 'views') as total_views,
                     SUM(o.total_quantity) FILTER (WHERE o.service_type = 'reactions') as total_reactions,
-                    SUM(o.total_quantity) FILTER (WHERE o.service_type = 'reposts') as total_reposts
+                    SUM(o.total_quantity) FILTER (WHERE o.service_type = 'reposts') as total_reposts,
+                    SUM(o.total_quantity * s.price_per_1000 / 1000) as total_cost,
+                    AVG(EXTRACT(EPOCH FROM (o.completed_at - o.started_at))/60) 
+                        FILTER (WHERE o.completed_at IS NOT NULL) as avg_processing_time
                 FROM orders o
                 JOIN posts p ON p.id = o.post_id
+                LEFT JOIN services s ON s.nakrutka_id = o.service_id
                 WHERE p.channel_id = $1
+            ),
+            channel_info AS (
+                SELECT channel_username FROM channels WHERE id = $1
             )
-            SELECT * FROM post_stats, order_stats
+            SELECT 
+                $1 as channel_id,
+                ci.channel_username,
+                COALESCE(ps.total_posts, 0) as total_posts,
+                COALESCE(ps.completed_posts, 0) as completed_posts,
+                COALESCE(ps.processing_posts, 0) as processing_posts,
+                COALESCE(ps.failed_posts, 0) as failed_posts,
+                COALESCE(os.total_views, 0) as total_views,
+                COALESCE(os.total_reactions, 0) as total_reactions,
+                COALESCE(os.total_reposts, 0) as total_reposts,
+                COALESCE(os.total_cost, 0) as total_cost,
+                COALESCE(os.avg_processing_time, 0) as avg_processing_time,
+                ps.last_post_date
+            FROM channel_info ci, post_stats ps, order_stats os
         """
+
         row = await self.db.fetchrow(query, channel_id)
-        return dict(row) if row else {}
+        if not row:
+            # Return empty stats
+            return ChannelStats(
+                channel_id=channel_id,
+                channel_username='unknown'
+            )
+
+        return ChannelStats.from_db_row(dict(row))
+
+    async def get_service_stats(
+        self,
+        service_id: int,
+        days: int = 30
+    ) -> ServiceStats:
+        """Get service performance statistics"""
+        service = await self.get_service(service_id)
+        if not service:
+            raise ValueError(f"Service {service_id} not found")
+
+        query = """
+            SELECT 
+                COUNT(*) as total_orders,
+                COUNT(*) FILTER (WHERE status = 'completed') as completed_orders,
+                COUNT(*) FILTER (WHERE status IN ('failed', 'cancelled')) as failed_orders,
+                SUM(total_quantity) as total_quantity,
+                SUM(total_quantity * $2 / 1000) as total_cost,
+                AVG(EXTRACT(EPOCH FROM (completed_at - started_at))/60) 
+                    FILTER (WHERE completed_at IS NOT NULL) as avg_completion_time,
+                MAX(created_at) as last_used
+            FROM orders
+            WHERE service_id = $1
+            AND created_at > NOW() - INTERVAL '%s days'
+        """
+
+        row = await self.db.fetchrow(query % days, service_id, float(service.price_per_1000))
+
+        if not row:
+            return ServiceStats(
+                service_id=service_id,
+                service_name=service.service_name,
+                service_type=ServiceType(service.service_type)
+            )
+
+        stats_data = dict(row)
+
+        # Calculate success rate
+        if stats_data['total_orders'] > 0:
+            stats_data['success_rate'] = (
+                stats_data['completed_orders'] / stats_data['total_orders'] * 100
+            )
+        else:
+            stats_data['success_rate'] = 0.0
+
+        return ServiceStats.from_db_data(service, stats_data)
 
     async def get_today_costs(self) -> Dict[str, float]:
         """Get today's costs by service type"""
@@ -665,24 +1057,26 @@ class Queries:
                 COUNT(*) FILTER (WHERE status = 'completed') as completed_orders,
                 COUNT(*) FILTER (WHERE status = 'failed') as failed_orders,
                 AVG(total_quantity) as avg_quantity,
-                SUM(total_quantity) as total_quantity
+                SUM(total_quantity) as total_quantity,
+                MIN(created_at) as first_order,
+                MAX(created_at) as last_order
             FROM orders
             WHERE service_id = $1
             AND created_at > NOW() - INTERVAL '%s days'
         """
         row = await self.db.fetchrow(query % days, service_id)
 
-        if not row:
-            return {}
+        if not row or row['total_orders'] == 0:
+            return {
+                'total_orders': 0,
+                'success_rate': 0,
+                'failure_rate': 0
+            }
 
         result = dict(row)
         total = result['total_orders']
-        if total > 0:
-            result['success_rate'] = result['completed_orders'] / total
-            result['failure_rate'] = result['failed_orders'] / total
-        else:
-            result['success_rate'] = 0
-            result['failure_rate'] = 0
+        result['success_rate'] = result['completed_orders'] / total
+        result['failure_rate'] = result['failed_orders'] / total
 
         return result
 
@@ -763,19 +1157,35 @@ class Queries:
         row = await self.db.fetchrow(query)
         return dict(row) if row else {}
 
-    async def get_failed_orders(self, hours: int = 24) -> List[Order]:
-        """Get recent failed orders"""
+    async def get_failed_orders(self, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get recent failed orders with details"""
         query = """
-            SELECT o.*, p.post_url, c.channel_username
+            SELECT 
+                o.*,
+                p.post_url,
+                c.channel_username,
+                s.service_name
             FROM orders o
             JOIN posts p ON p.id = o.post_id
             JOIN channels c ON c.id = p.channel_id
-            WHERE o.status = 'failed'
+            LEFT JOIN services s ON s.nakrutka_id = o.service_id
+            WHERE o.status IN ('failed', 'cancelled')
             AND o.created_at > NOW() - INTERVAL '%s hours'
             ORDER BY o.created_at DESC
         """
         rows = await self.db.fetch(query % hours)
-        return [Order.from_db_row(dict(row)) for row in rows]
+
+        results = []
+        for row in rows:
+            order = Order.from_db_row(dict(row))
+            results.append({
+                'order': order,
+                'post_url': row['post_url'],
+                'channel_username': row['channel_username'],
+                'service_name': row['service_name']
+            })
+
+        return results
 
     # ============ ADVANCED QUERIES ============
 
@@ -783,7 +1193,7 @@ class Queries:
         self,
         service_type: str,
         limit: int = 5
-    ) -> List[Tuple[Service, Dict[str, Any]]]:
+    ) -> List[Tuple[Service, ServiceStats]]:
         """Find best performing services by success rate"""
         query = """
             WITH service_performance AS (
@@ -791,9 +1201,15 @@ class Queries:
                     s.*,
                     COUNT(o.id) as total_orders,
                     COUNT(o.id) FILTER (WHERE o.status = 'completed') as completed_orders,
-                    AVG(o.total_quantity) as avg_quantity
+                    COUNT(o.id) FILTER (WHERE o.status IN ('failed', 'cancelled')) as failed_orders,
+                    SUM(o.total_quantity) as total_quantity,
+                    SUM(o.total_quantity * s.price_per_1000 / 1000) as total_cost,
+                    AVG(EXTRACT(EPOCH FROM (o.completed_at - o.started_at))/60) 
+                        FILTER (WHERE o.completed_at IS NOT NULL) as avg_completion_time,
+                    MAX(o.created_at) as last_used
                 FROM services s
                 LEFT JOIN orders o ON o.service_id = s.nakrutka_id
+                    AND o.created_at > NOW() - INTERVAL '30 days'
                 WHERE s.service_type = $1
                 AND s.is_active = true
                 GROUP BY s.id
@@ -809,17 +1225,31 @@ class Queries:
         results = []
         for row in rows:
             data = dict(row)
-            service_data = {k: v for k, v in data.items() if k in Service.__annotations__}
+
+            # Extract service data
+            service_data = {
+                k: v for k, v in data.items()
+                if k in Service.__annotations__
+            }
             service = Service.from_db_row(service_data)
 
-            performance = {
+            # Create stats
+            stats_data = {
                 'total_orders': data['total_orders'],
                 'completed_orders': data['completed_orders'],
-                'success_rate': data['completed_orders'] / data['total_orders'],
-                'avg_quantity': data['avg_quantity']
+                'failed_orders': data['failed_orders'],
+                'total_quantity': data['total_quantity'],
+                'total_cost': data['total_cost'],
+                'avg_completion_time': data['avg_completion_time'] or 0,
+                'last_used': data['last_used'],
+                'success_rate': (
+                    data['completed_orders'] / data['total_orders'] * 100
+                    if data['total_orders'] > 0 else 0
+                )
             }
 
-            results.append((service, performance))
+            stats = ServiceStats.from_db_data(service, stats_data)
+            results.append((service, stats))
 
         return results
 
@@ -844,40 +1274,109 @@ class Queries:
     async def optimize_service_selection(
         self,
         service_type: str,
-        quantity: int
+        quantity: int,
+        channel_id: Optional[int] = None
     ) -> Optional[Service]:
         """Select optimal service based on performance and price"""
-        # Get services with performance
-        services_perf = await self.find_best_performing_services(service_type, 10)
+        # Get channel preferences if available
+        preferred_features = []
+        if channel_id:
+            config = await self.get_channel_config(channel_id)
+            if config and config.settings:
+                # Could add preferred features based on channel settings
+                pass
 
-        if not services_perf:
-            # Fallback to cheapest
-            return await self.get_cheapest_service(service_type)
+        # Find best service
+        return await self.find_best_service(
+            service_type=service_type,
+            quantity=quantity,
+            preferred_features=preferred_features
+        )
 
-        # Score services by success rate and price
-        best_service = None
-        best_score = -1
-
-        for service, performance in services_perf:
-            # Skip if quantity out of bounds
-            if not service.validate_quantity(quantity):
-                continue
-
-            # Calculate score (higher success rate, lower price = better)
-            success_weight = 0.7
-            price_weight = 0.3
-
-            # Normalize price (inverse - lower is better)
-            max_price = max(s[0].price_per_1000 for s in services_perf)
-            price_score = 1 - (float(service.price_per_1000) / float(max_price))
-
-            score = (
-                success_weight * performance['success_rate'] +
-                price_weight * price_score
+    async def get_processing_queue_status(self) -> Dict[str, Any]:
+        """Get current processing queue status"""
+        query = """
+            WITH queue_stats AS (
+                SELECT 
+                    COUNT(*) FILTER (WHERE status = 'new') as new_posts,
+                    COUNT(*) FILTER (WHERE status = 'processing') as processing_posts,
+                    MIN(created_at) FILTER (WHERE status = 'new') as oldest_new_post
+                FROM posts
+                WHERE status IN ('new', 'processing')
+            ),
+            active_portions AS (
+                SELECT COUNT(*) as active_portions
+                FROM order_portions
+                WHERE status IN ('waiting', 'running')
             )
+            SELECT 
+                qs.*,
+                ap.active_portions
+            FROM queue_stats qs, active_portions ap
+        """
 
-            if score > best_score:
-                best_score = score
-                best_service = service
+        row = await self.db.fetchrow(query)
+        if not row:
+            return {
+                'new_posts': 0,
+                'processing_posts': 0,
+                'active_portions': 0,
+                'queue_age_minutes': 0
+            }
 
-        return best_service
+        result = dict(row)
+
+        # Calculate queue age
+        if result['oldest_new_post']:
+            age = datetime.utcnow() - result['oldest_new_post']
+            result['queue_age_minutes'] = int(age.total_seconds() / 60)
+        else:
+            result['queue_age_minutes'] = 0
+
+        return result
+
+    # ============ CACHE MANAGEMENT ============
+
+    def clear_all_caches(self):
+        """Clear all internal caches"""
+        self._service_cache.clear()
+        self._channel_config_cache.clear()
+        logger.info("All caches cleared")
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        return {
+            'service_cache_size': len(self._service_cache.services),
+            'channel_config_cache_size': len(self._channel_config_cache),
+            'service_cache_age': (
+                (datetime.utcnow() - self._service_cache.last_updated).total_seconds()
+                if self._service_cache.last_updated else 0
+            )
+        }
+
+
+# ============ CACHE MODELS ============
+
+@dataclass
+class ServiceCache:
+    """Cache for services to avoid frequent DB queries"""
+    services: Dict[NakrutkaServiceID, Service] = field(default_factory=dict)
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+
+    def add_service(self, service: Service):
+        """Add service to cache"""
+        self.services[service.nakrutka_id] = service
+
+    def get_service(self, nakrutka_id: NakrutkaServiceID) -> Optional[Service]:
+        """Get service from cache"""
+        return self.services.get(nakrutka_id)
+
+    def is_stale(self, max_age_minutes: int = 60) -> bool:
+        """Check if cache is stale"""
+        age = datetime.utcnow() - self.last_updated
+        return age.total_seconds() > max_age_minutes * 60
+
+    def clear(self):
+        """Clear cache"""
+        self.services.clear()
+        self.last_updated = datetime.utcnow()
