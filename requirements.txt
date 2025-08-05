@@ -1,0 +1,29 @@
+# Core dependencies
+python-telegram-bot==20.8
+asyncpg==0.29.0
+aiohttp==3.9.3
+python-dotenv==1.0.1
+pydantic==2.6.1
+pydantic-settings==2.2.1
+
+# Scheduler
+apscheduler==3.10.4
+
+# Database
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.27
+
+# Utils
+python-dateutil==2.9.0
+pytz==2024.1
+tenacity==8.2.3
+
+# Logging
+structlog==24.1.0
+colorama==0.4.6
+
+# Development
+pytest==8.0.2
+pytest-asyncio==0.23.5
+black==24.2.0
+flake8==7.0.0
