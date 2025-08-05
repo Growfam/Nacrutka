@@ -4,7 +4,7 @@ Configuration management for Telegram SMM Bot
 import os
 from typing import Optional
 from pydantic_settings import BaseSettings
-from pydantic import Field, PostgresDsn
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
 
     # Database
-    database_url: PostgresDsn = Field(..., env="DATABASE_URL")
+    database_url: str = Field(..., env="DATABASE_URL")
 
     # Supabase
     supabase_url: str = Field(..., env="SUPABASE_URL")
@@ -44,34 +44,37 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = False
+        extra = "ignore"  # Ігнорувати додаткові поля
 
 
 # Create global settings instance
 settings = Settings()
 
+
 # Service IDs mapping (from database)
 SERVICE_IDS = {
     "views": {
         "instant": 3791,  # Моментальные
-        "slow": 4331,  # Медленные
+        "slow": 4331,     # Медленные
         "kazakhstan": 3822,  # Казахстан
-        "usa": 4014,  # США
-        "auto_cis": 4105,  # Авто СНГ
+        "usa": 4014,      # США
+        "auto_cis": 4105, # Авто СНГ
     },
     "reactions": {
         "positive_mix": 3911,  # 👍 ❤️ 🔥 🎉
         "negative_mix": 3870,  # 👎 😁 😢 💩 🤮
-        "premium_mix": 4002,  # Premium позитивные
-        "heart": 3850,  # ❤️
-        "fire": 3849,  # 🔥
-        "thumbs_up": 3838,  # 👍
-        "lightning": 3839,  # ⚡️
-        "whale": 3872,  # 🐳
+        "premium_mix": 4002,   # Premium позитивные
+        "heart": 3850,         # ❤️
+        "fire": 3849,          # 🔥
+        "thumbs_up": 3838,     # 👍
+        "lightning": 3839,     # ⚡️
+        "whale": 3872,         # 🐳
     },
     "reposts": {
         "statistics": 3943,  # Для статистики
     }
 }
+
 
 # Status mappings
 POST_STATUS = {

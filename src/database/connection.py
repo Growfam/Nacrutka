@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from src.config import settings
 from src.utils.logger import get_logger
 
+
 logger = get_logger(__name__)
 
 
@@ -21,7 +22,7 @@ class DatabaseConnection:
         """Initialize connection pool"""
         try:
             self.pool = await asyncpg.create_pool(
-                str(settings.database_url),
+                settings.database_url,
                 min_size=5,
                 max_size=20,
                 max_queries=50000,
