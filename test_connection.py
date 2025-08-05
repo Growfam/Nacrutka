@@ -1,39 +1,44 @@
-# Створи файл test_connection.py в корені проекту:
-
+# test_db_simple.py
 import asyncio
-from src.database.connection import db, test_connection
-from src.config import settings
+import asyncpg
+import os
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-async def main():
-    print("Testing database connection...")
-    print(f"Database URL: {settings.database_url}")
+async def test_methods():
+    # Метод 1: URL з екрануванням
+    print("Testing Method 1: URL with escaping...")
+    try:
+        password = quote_plus("Rostak987()")
+        url = f"postgresql://postgres:{password}@db.fifyjyhlafmckyhdpraf.supabase.co:5432/postgres"
 
-    await db.init()
-    result = await test_connection()
+        conn = await asyncpg.connect(url)
+        version = await conn.fetchval('SELECT version()')
+        print(f"✅ Method 1 works! {version[:30]}...")
+        await conn.close()
+    except Exception as e:
+        print(f"❌ Method 1 failed: {e}")
 
-    if result:
-        print("✅ Database connection successful!")
+    print("\n" + "=" * 50 + "\n")
 
-        # Test query
-        version = await db.fetchval("SELECT version()")
-        print(f"PostgreSQL version: {version}")
-
-        # Check tables
-        tables = await db.fetch("""
-                                SELECT tablename
-                                FROM pg_tables
-                                WHERE schemaname = 'public'
-                                ORDER BY tablename
-                                """)
-        print(f"\nFound {len(tables)} tables:")
-        for table in tables:
-            print(f"  - {table['tablename']}")
-    else:
-        print("❌ Database connection failed!")
-
-    await db.close()
+    # Метод 2: Окремі параметри
+    print("Testing Method 2: Separate parameters...")
+    try:
+        conn = await asyncpg.connect(
+            host='db.fifyjyhlafmckyhdpraf.supabase.co',
+            port=5432,
+            database='postgres',
+            user='postgres',
+            password='Rostak987()'
+        )
+        version = await conn.fetchval('SELECT version()')
+        print(f"✅ Method 2 works! {version[:30]}...")
+        await conn.close()
+    except Exception as e:
+        print(f"❌ Method 2 failed: {e}")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(test_methods())
