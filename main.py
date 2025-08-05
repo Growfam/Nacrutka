@@ -30,11 +30,74 @@ class TelegramSMMBot:
         self.scheduler: Optional[BotScheduler] = None
         self.running = False
 
+    async def verify_database(self):
+        """Verify database tables and connection"""
+        logger.info("Verifying database structure...")
+
+        required_tables = [
+            'channels', 'channel_settings', 'posts', 'orders',
+            'order_portions', 'services', 'portion_templates',
+            'channel_reaction_services', 'api_keys', 'logs'
+        ]
+
+        try:
+            for table in required_tables:
+                count = await self.db.fetchval(f"SELECT COUNT(*) FROM {table}")
+                logger.info(f"Table '{table}' exists, records: {count}")
+
+            # Check active channels
+            active_channels = await self.db.fetchval(
+                "SELECT COUNT(*) FROM channels WHERE is_active = true"
+            )
+            logger.info(f"Active channels: {active_channels}")
+
+            if active_channels == 0:
+                logger.warning("No active channels found!")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Database verification failed: {str(e)}")
+            return False
+
+    async def verify_nakrutka(self):
+        """Verify Nakrutka API connection"""
+        logger.info("Verifying Nakrutka API...")
+
+        try:
+            balance = await self.nakrutka_client.get_balance()
+            logger.info(f"Nakrutka API connected, balance: {balance.get('balance')} {balance.get('currency')}")
+
+            # Check if API key is valid
+            if 'error' in balance:
+                logger.error(f"Nakrutka API error: {balance['error']}")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Nakrutka API verification failed: {str(e)}")
+            return False
+
+    async def verify_telegram(self):
+        """Verify Telegram Bot API"""
+        logger.info("Verifying Telegram Bot API...")
+
+        try:
+            bot_info = await self.telegram_monitor.bot.get_me()
+            logger.info(f"Telegram bot connected: @{bot_info.username}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Telegram API verification failed: {str(e)}")
+            return False
+
     async def setup(self):
         """Initialize all components"""
         logger.info("Starting Telegram SMM Bot setup...")
         logger.info(f"Environment: {settings.environment}")
         logger.info(f"Log level: {settings.log_level}")
+        logger.info(f"Check interval: {settings.check_interval}s")
 
         try:
             # Initialize database
@@ -49,6 +112,10 @@ class TelegramSMMBot:
                 raise Exception("Database connection failed")
             logger.info("Database connection test passed")
 
+            # Verify database structure
+            if not await self.verify_database():
+                raise Exception("Database structure verification failed")
+
             # Initialize database logger
             logger.info("Initializing database logger...")
             self.db_logger = DatabaseLogger(self.db)
@@ -60,9 +127,19 @@ class TelegramSMMBot:
             self.nakrutka_client = NakrutkaClient()
             logger.info("Nakrutka client initialized")
 
+            # Verify Nakrutka API
+            if not await self.verify_nakrutka():
+                logger.error("Nakrutka API not working properly!")
+                # Continue anyway, will fail on actual orders
+
             logger.info("Initializing Telegram monitor...")
             self.telegram_monitor = TelegramMonitor(self.db)
             logger.info("Telegram monitor initialized")
+
+            # Verify Telegram Bot API
+            if not await self.verify_telegram():
+                logger.error("Telegram Bot API not working properly!")
+                # Continue anyway
 
             logger.info("Initializing post processor...")
             self.post_processor = PostProcessor(self.db, self.nakrutka_client)
@@ -98,6 +175,7 @@ class TelegramSMMBot:
             logger.info("Status checker scheduled (interval: 60s)")
 
             logger.info("Bot setup completed successfully")
+            logger.info("=" * 50)
 
         except Exception as e:
             logger.error(f"Setup failed: {str(e)}", exc_info=True)
@@ -133,6 +211,10 @@ class TelegramSMMBot:
                 # Log heartbeat every minute
                 if loop_counter % 60 == 0:
                     logger.debug(f"Bot heartbeat - running for {loop_counter} seconds")
+
+                    # Log active jobs
+                    jobs = self.scheduler.get_jobs()
+                    logger.debug(f"Active scheduled jobs: {len(jobs)}")
 
         except Exception as e:
             logger.error(f"Error in start: {str(e)}", exc_info=True)
@@ -176,6 +258,11 @@ async def main():
     logger.info("=== TELEGRAM SMM BOT STARTING ===")
     logger.info(f"Python version: {sys.version}")
     logger.info(f"Platform: {sys.platform}")
+
+    # Log environment variables (without sensitive data)
+    logger.info(f"DATABASE_URL configured: {'Yes' if settings.database_url else 'No'}")
+    logger.info(f"NAKRUTKA_API_KEY configured: {'Yes' if settings.nakrutka_api_key else 'No'}")
+    logger.info(f"TELEGRAM_BOT_TOKEN configured: {'Yes' if settings.telegram_bot_token else 'No'}")
 
     bot = TelegramSMMBot()
 
