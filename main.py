@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram SMM Bot - Main entry point
-Complete implementation with all features
+Telegram SMM Bot - Main entry point with database initialization
 """
 import asyncio
 import signal
@@ -12,18 +11,21 @@ from datetime import datetime
 
 from src.config import settings
 from src.database.connection import db, test_connection
+from src.database.migrations import initialize_database, DatabaseMigrations
+from src.database.initialize import DatabaseInitializer
 from src.utils.logger import get_logger, DatabaseLogger
 from src.services.telegram import TelegramMonitor
 from src.services.processor import PostProcessor
 from src.services.nakrutka import NakrutkaClient
 from src.utils.scheduler import BotScheduler
 from src.utils.helpers import PerformanceMonitor
+from src.utils.validators import ConfigValidator
 
 logger = get_logger(__name__)
 
 
 class TelegramSMMBot:
-    """Main bot application"""
+    """Main bot application with enhanced initialization"""
 
     def __init__(self):
         self.db = db
@@ -36,250 +38,309 @@ class TelegramSMMBot:
         self.running = False
         self.start_time = datetime.utcnow()
 
+        # Track initialization status
+        self.init_status = {
+            'environment': False,
+            'database': False,
+            'database_schema': False,
+            'services': False,
+            'nakrutka': False,
+            'telegram': False
+        }
+
     async def verify_environment(self):
         """Verify environment variables and configuration"""
+        logger.info("=" * 50)
         logger.info("Verifying environment configuration...")
 
-        required_vars = [
-            'DATABASE_URL',
-            'NAKRUTKA_API_KEY',
-            'TELEGRAM_BOT_TOKEN'
-        ]
+        # Use config validator
+        errors = ConfigValidator.validate_environment()
 
-        missing_vars = []
-        for var in required_vars:
-            if not os.getenv(var):
-                missing_vars.append(var)
+        if errors:
+            logger.error("Environment validation failed", errors=errors)
+            for error in errors:
+                logger.error(f"  - {error}")
+            raise Exception(f"Invalid environment: {'; '.join(errors)}")
 
-        if missing_vars:
-            logger.error(f"Missing required environment variables: {missing_vars}")
-            raise Exception(f"Missing environment variables: {', '.join(missing_vars)}")
-
-        logger.info("Environment configuration verified")
+        logger.info("✅ Environment configuration verified")
+        self.init_status['environment'] = True
         return True
 
-    async def verify_database(self):
-        """Verify database tables and connection"""
-        logger.info("Verifying database structure...")
-
-        required_tables = [
-            'channels', 'channel_settings', 'posts', 'orders',
-            'order_portions', 'services', 'portion_templates',
-            'channel_reaction_services', 'api_keys', 'logs'
-        ]
+    async def initialize_database(self):
+        """Initialize database with migrations and default data"""
+        logger.info("=" * 50)
+        logger.info("Initializing database...")
 
         try:
-            # Check each table
-            missing_tables = []
-            for table in required_tables:
-                try:
-                    count = await self.db.fetchval(f"SELECT COUNT(*) FROM {table}")
-                    logger.info(f"Table '{table}' exists, records: {count}")
-                except Exception:
-                    missing_tables.append(table)
+            # Initialize connection pool
+            logger.info("Creating database connection pool...")
+            await self.db.init()
+            logger.info("✅ Database pool created")
 
-            if missing_tables:
-                logger.error(f"Missing tables: {missing_tables}")
-                return False
+            # Test connection
+            logger.info("Testing database connection...")
+            if not await test_connection():
+                raise Exception("Database connection test failed")
+            logger.info("✅ Database connection established")
 
-            # Check active channels
-            active_channels = await self.db.fetchval(
-                "SELECT COUNT(*) FROM channels WHERE is_active = true"
+            self.init_status['database'] = True
+
+            # Run migrations
+            logger.info("Checking database schema...")
+            integrity = await initialize_database(self.db)
+
+            # Validate schema
+            schema_errors = ConfigValidator.validate_database_schema(integrity)
+            if schema_errors:
+                logger.error("Database schema validation failed", errors=schema_errors)
+                for error in schema_errors:
+                    logger.error(f"  - {error}")
+                raise Exception("Invalid database schema")
+
+            logger.info(
+                "✅ Database schema verified",
+                tables=len(integrity.get('tables', {})),
+                functions=len(integrity.get('functions', {})),
+                views=len(integrity.get('views', {}))
             )
-            logger.info(f"Active channels: {active_channels}")
+            self.init_status['database_schema'] = True
 
-            if active_channels == 0:
-                logger.warning("No active channels found! Add channels to database.")
+            # Initialize default data
+            logger.info("Initializing default data...")
+            initializer = DatabaseInitializer(self.db)
+            await initializer.initialize_all()
 
-            # Check services
-            services_count = await self.db.fetchval(
-                "SELECT COUNT(*) FROM services WHERE is_active = true"
+            # Verify initialization
+            verify_result = await initializer.verify_initialization()
+            if verify_result['errors']:
+                logger.warning(
+                    "Database initialization warnings",
+                    warnings=verify_result['errors']
+                )
+
+            logger.info(
+                "✅ Database initialized",
+                services=verify_result['services'],
+                channels=verify_result['channels'],
+                api_keys=verify_result['api_keys']
             )
-            logger.info(f"Active services: {services_count}")
-
-            if services_count == 0:
-                logger.error("No active services found in database!")
-                return False
-
-            # Check API key
-            api_key_exists = await self.db.fetchval(
-                "SELECT COUNT(*) FROM api_keys WHERE service_name = 'nakrutka' AND is_active = true"
-            )
-
-            if not api_key_exists:
-                logger.warning("No Nakrutka API key in database, using from environment")
+            self.init_status['services'] = True
 
             return True
 
         except Exception as e:
-            logger.error(f"Database verification failed: {str(e)}")
-            return False
+            logger.error("Database initialization failed", error=str(e), exc_info=True)
+            raise
 
     async def verify_nakrutka(self):
-        """Verify Nakrutka API connection"""
+        """Verify Nakrutka API connection and configuration"""
+        logger.info("=" * 50)
         logger.info("Verifying Nakrutka API...")
 
         try:
-            balance = await self.nakrutka_client.get_balance()
+            # Perform health check
+            health = await self.nakrutka_client.health_check()
 
-            # Check if response is valid
-            if not isinstance(balance, dict):
-                logger.error(f"Invalid balance response: {balance}")
+            if health['status'] != 'healthy':
+                logger.error(
+                    "Nakrutka health check failed",
+                    status=health['status'],
+                    errors=health.get('errors', [])
+                )
+
+                # Don't fail completely, just warn
+                if health['status'] == 'auth_error':
+                    logger.error("❌ Nakrutka authentication failed - check API key")
+                    await self.db_logger.error(
+                        "Nakrutka auth failed",
+                        message="Invalid API key or authentication error"
+                    )
+                elif health['status'] == 'connection_error':
+                    logger.error("❌ Cannot connect to Nakrutka API")
+                    await self.db_logger.error(
+                        "Nakrutka connection failed",
+                        message="Cannot reach Nakrutka API servers"
+                    )
+
+                self.init_status['nakrutka'] = False
                 return False
 
-            if 'balance' not in balance:
-                logger.error(f"No balance in response: {balance}")
-                return False
-
-            balance_amount = float(balance.get('balance', 0))
-            currency = balance.get('currency', 'USD')
-
+            # Log success
             logger.info(
-                f"Nakrutka API connected successfully",
-                balance=balance_amount,
-                currency=currency
+                "✅ Nakrutka API connected",
+                balance=f"${health.get('balance', 0):.2f}",
+                currency=health.get('currency', 'USD'),
+                services=health.get('service_count', 0)
             )
 
             # Check minimum balance
-            if balance_amount < 1:
+            balance = float(health.get('balance', 0))
+            if balance < 1:
+                logger.error(
+                    "❌ Nakrutka balance critically low",
+                    balance=balance,
+                    currency=health.get('currency', 'USD')
+                )
+                await self.db_logger.error(
+                    "Critical: Low Nakrutka balance",
+                    balance=balance,
+                    message="Bot may not be able to create orders"
+                )
+            elif balance < 10:
                 logger.warning(
-                    f"Very low Nakrutka balance: {balance_amount} {currency}"
+                    "⚠️ Low Nakrutka balance",
+                    balance=balance,
+                    currency=health.get('currency', 'USD')
                 )
                 await self.db_logger.warning(
                     "Low Nakrutka balance",
-                    balance=balance_amount,
-                    currency=currency
+                    balance=balance,
+                    message="Consider adding funds soon"
                 )
 
-            # Test service availability
-            try:
-                services = await self.nakrutka_client.get_services()
-                logger.info(f"Nakrutka has {len(services)} services available")
-            except Exception as e:
-                logger.warning(f"Could not fetch services: {e}")
-
+            self.init_status['nakrutka'] = True
             return True
 
         except Exception as e:
-            logger.error(f"Nakrutka API verification failed: {str(e)}")
+            logger.error("Nakrutka verification failed", error=str(e))
+            self.init_status['nakrutka'] = False
             return False
 
     async def verify_telegram(self):
         """Verify Telegram Bot API"""
+        logger.info("=" * 50)
         logger.info("Verifying Telegram Bot API...")
 
         try:
             bot_info = await self.telegram_monitor.bot.get_me()
             logger.info(
-                f"Telegram bot connected",
+                "✅ Telegram bot verified",
                 username=bot_info.username,
                 bot_id=bot_info.id,
                 can_read_all_group_messages=bot_info.can_read_all_group_messages
             )
 
+            if not bot_info.can_read_all_group_messages:
+                logger.warning(
+                    "⚠️ Bot cannot read all group messages",
+                    hint="Bot may not see channel posts if not admin"
+                )
+
+            self.init_status['telegram'] = True
             return True
 
         except Exception as e:
-            logger.error(f"Telegram API verification failed: {str(e)}")
+            logger.error("Telegram API verification failed", error=str(e))
+            self.init_status['telegram'] = False
             return False
 
     async def setup(self):
-        """Initialize all components"""
-        logger.info("=" * 50)
-        logger.info("Starting Telegram SMM Bot setup...")
+        """Initialize all components with enhanced error handling"""
+        logger.info("=" * 70)
+        logger.info("🚀 TELEGRAM SMM BOT STARTING")
+        logger.info("=" * 70)
         logger.info(f"Environment: {settings.environment}")
         logger.info(f"Log level: {settings.log_level}")
         logger.info(f"Check interval: {settings.check_interval}s")
         logger.info(f"Timezone: {settings.timezone}")
 
         try:
-            # Verify environment
+            # 1. Verify environment
             await self.verify_environment()
 
-            # Initialize database
-            logger.info("Initializing database connection...")
-            await self.db.init()
-            logger.info("Database pool created successfully")
+            # 2. Initialize and verify database
+            await self.initialize_database()
 
-            # Test connection
-            logger.info("Testing database connection...")
-            if not await test_connection():
-                logger.error("Database connection test failed")
-                raise Exception("Database connection failed")
-            logger.info("Database connection test passed")
-
-            # Verify database structure
-            if not await self.verify_database():
-                raise Exception("Database structure verification failed")
-
-            # Initialize database logger
+            # 3. Initialize database logger
             logger.info("Initializing database logger...")
             self.db_logger = DatabaseLogger(self.db)
             await self.db_logger.info(
                 "Bot starting",
                 environment=settings.environment,
-                version="1.0.0"
+                version="1.0.0",
+                python_version=sys.version
             )
-            logger.info("Database logger initialized")
+            logger.info("✅ Database logger initialized")
 
-            # Initialize services
+            # 4. Initialize Nakrutka client
             logger.info("Initializing Nakrutka client...")
             self.nakrutka_client = NakrutkaClient()
-            logger.info("Nakrutka client initialized")
+            logger.info("✅ Nakrutka client initialized")
 
-            # Verify Nakrutka API
+            # 5. Verify Nakrutka API
             nakrutka_ok = await self.verify_nakrutka()
             if not nakrutka_ok:
-                logger.error("Nakrutka API not working properly!")
+                logger.error("⚠️ Nakrutka API not working properly!")
                 await self.db_logger.warning(
-                    "Nakrutka API verification failed",
+                    "Nakrutka API issues",
                     message="Bot will continue but orders may fail"
                 )
 
+            # 6. Initialize Telegram monitor with Nakrutka client
             logger.info("Initializing Telegram monitor...")
-            self.telegram_monitor = TelegramMonitor(self.db)
-            self.telegram_monitor.nakrutka_client = self.nakrutka_client  # Pass reference
+            self.telegram_monitor = TelegramMonitor(self.db, self.nakrutka_client)
             await self.telegram_monitor.setup_bot()
-            logger.info("Telegram monitor initialized")
+            logger.info("✅ Telegram monitor initialized")
 
-            # Verify Telegram Bot API
+            # 7. Verify Telegram Bot API
             telegram_ok = await self.verify_telegram()
             if not telegram_ok:
-                logger.error("Telegram Bot API not working properly!")
+                logger.error("⚠️ Telegram Bot API not working properly!")
                 await self.db_logger.warning(
-                    "Telegram Bot API verification failed",
+                    "Telegram Bot API issues",
                     message="Bot commands may not work"
                 )
 
+            # 8. Initialize post processor
             logger.info("Initializing post processor...")
             self.post_processor = PostProcessor(self.db, self.nakrutka_client)
-            logger.info("Post processor initialized")
+            logger.info("✅ Post processor initialized")
 
-            # Initialize scheduler
+            # 9. Initialize scheduler
             logger.info("Initializing scheduler...")
             self.scheduler = BotScheduler()
-            logger.info("Scheduler initialized")
+            logger.info("✅ Scheduler initialized")
 
-            # Schedule tasks
+            # 10. Schedule tasks
             await self._schedule_tasks()
 
-            logger.info("Bot setup completed successfully")
-            logger.info("=" * 50)
+            # Log final status
+            logger.info("=" * 70)
+            logger.info("🎉 BOT SETUP COMPLETED")
+            logger.info("=" * 70)
 
-            # Log summary
+            # Summary of initialization
+            success_count = sum(1 for v in self.init_status.values() if v)
+            total_count = len(self.init_status)
+
+            logger.info(
+                "Initialization summary",
+                successful=f"{success_count}/{total_count}",
+                status=self.init_status
+            )
+
             await self.db_logger.info(
                 "Bot setup completed",
+                initialization_status=self.init_status,
                 nakrutka_ok=nakrutka_ok,
                 telegram_ok=telegram_ok,
                 environment=settings.environment
             )
 
+            # Warn if critical components failed
+            if not self.init_status['nakrutka']:
+                logger.warning("⚠️ Running without Nakrutka - orders will fail!")
+            if not self.init_status['telegram']:
+                logger.warning("⚠️ Running without Telegram commands!")
+
         except Exception as e:
-            logger.error(f"Setup failed: {str(e)}", exc_info=True)
+            logger.error("Setup failed", error=str(e), exc_info=True)
             if self.db_logger:
                 await self.db_logger.error(
                     "Bot setup failed",
-                    error=str(e)
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    initialization_status=self.init_status
                 )
             raise
 
@@ -293,7 +354,7 @@ class TelegramSMMBot:
             interval_seconds=settings.check_interval,
             job_id="channel_monitor"
         )
-        logger.info(f"Channel monitor scheduled (interval: {settings.check_interval}s)")
+        logger.info(f"✅ Channel monitor scheduled (interval: {settings.check_interval}s)")
 
         # Post processing - frequent
         self.scheduler.add_job(
@@ -301,7 +362,7 @@ class TelegramSMMBot:
             interval_seconds=10,
             job_id="post_processor"
         )
-        logger.info("Post processor scheduled (interval: 10s)")
+        logger.info("✅ Post processor scheduled (interval: 10s)")
 
         # Status checking - less frequent
         self.scheduler.add_job(
@@ -309,7 +370,7 @@ class TelegramSMMBot:
             interval_seconds=60,
             job_id="status_checker"
         )
-        logger.info("Status checker scheduled (interval: 60s)")
+        logger.info("✅ Status checker scheduled (interval: 60s)")
 
         # Cleanup old logs - daily
         self.scheduler.add_job(
@@ -317,7 +378,7 @@ class TelegramSMMBot:
             interval_seconds=86400,  # 24 hours
             job_id="log_cleanup"
         )
-        logger.info("Log cleanup scheduled (interval: 24h)")
+        logger.info("✅ Log cleanup scheduled (interval: 24h)")
 
         # Health check - every 5 minutes
         self.scheduler.add_job(
@@ -325,7 +386,16 @@ class TelegramSMMBot:
             interval_seconds=300,
             job_id="health_check"
         )
-        logger.info("Health check scheduled (interval: 5m)")
+        logger.info("✅ Health check scheduled (interval: 5m)")
+
+        # Balance check - every hour
+        if self.init_status['nakrutka']:
+            self.scheduler.add_job(
+                self._check_balance,
+                interval_seconds=3600,
+                job_id="balance_check"
+            )
+            logger.info("✅ Balance check scheduled (interval: 1h)")
 
     async def _monitor_channels_with_metrics(self):
         """Monitor channels with performance metrics"""
@@ -355,45 +425,113 @@ class TelegramSMMBot:
             queries = Queries(self.db)
             deleted = await queries.cleanup_old_logs(days=7)
             logger.info(f"Cleaned up {deleted} old log entries")
+
+            # Also clean performance metrics
+            self.performance_monitor.clear_metrics()
+
         except Exception as e:
             logger.error(f"Log cleanup failed: {e}")
 
     async def _health_check(self):
-        """Perform health check"""
+        """Perform comprehensive health check"""
         try:
-            # Check database
-            db_ok = await test_connection()
-
-            # Check Nakrutka
-            try:
-                balance = await self.nakrutka_client.get_balance()
-                nakrutka_ok = 'balance' in balance
-            except:
-                nakrutka_ok = False
-
-            # Get performance stats
-            stats = {
+            health_status = {
+                'timestamp': datetime.utcnow().isoformat(),
                 'uptime_hours': (datetime.utcnow() - self.start_time).total_seconds() / 3600,
-                'database': 'OK' if db_ok else 'FAIL',
-                'nakrutka': 'OK' if nakrutka_ok else 'FAIL',
-                'performance': {
-                    name: self.performance_monitor.get_stats(name)
-                    for name in ['channel_monitoring', 'post_processing', 'status_checking']
-                }
+                'components': {}
             }
 
+            # Check database
+            try:
+                db_test = await test_connection()
+                health_status['components']['database'] = 'OK' if db_test else 'FAIL'
+            except:
+                health_status['components']['database'] = 'FAIL'
+
+            # Check Nakrutka
+            if self.nakrutka_client and self.init_status['nakrutka']:
+                try:
+                    nakrutka_health = await self.nakrutka_client.health_check()
+                    health_status['components']['nakrutka'] = nakrutka_health['status']
+                    health_status['nakrutka_balance'] = nakrutka_health.get('balance', 0)
+                except:
+                    health_status['components']['nakrutka'] = 'ERROR'
+            else:
+                health_status['components']['nakrutka'] = 'DISABLED'
+
+            # Check Telegram
+            health_status['components']['telegram'] = (
+                'OK' if self.telegram_monitor else 'DISABLED'
+            )
+
+            # Get performance stats
+            health_status['performance'] = {
+                name: self.performance_monitor.get_stats(name)
+                for name in ['channel_monitoring', 'post_processing', 'status_checking']
+            }
+
+            # Get monitoring stats
+            if self.telegram_monitor:
+                health_status['monitoring'] = self.telegram_monitor.get_monitor_stats()
+
+            # Log health status
             logger.info(
                 "Health check completed",
-                uptime_hours=f"{stats['uptime_hours']:.1f}",
-                database=stats['database'],
-                nakrutka=stats['nakrutka']
+                uptime_hours=f"{health_status['uptime_hours']:.1f}",
+                components=health_status['components']
             )
 
             # Log to database
-            await self.db_logger.info("Health check", **stats)
+            await self.db_logger.info("Health check", **health_status)
+
+            # Alert if issues found
+            issues = [
+                comp for comp, status in health_status['components'].items()
+                if status not in ['OK', 'DISABLED']
+            ]
+            if issues:
+                logger.warning(f"Health check found issues: {issues}")
+                await self.db_logger.warning(
+                    "Health check issues",
+                    failed_components=issues,
+                    details=health_status
+                )
 
         except Exception as e:
             logger.error(f"Health check failed: {e}")
+
+    async def _check_balance(self):
+        """Check Nakrutka balance periodically"""
+        if not self.nakrutka_client:
+            return
+
+        try:
+            balance_info = await self.nakrutka_client.get_balance()
+            balance = float(balance_info.get('balance', 0))
+            currency = balance_info.get('currency', 'USD')
+
+            logger.info(f"Balance check: ${balance:.2f} {currency}")
+
+            # Alert on low balance
+            if balance < 1:
+                logger.error(f"CRITICAL: Balance too low: ${balance:.2f}")
+                await self.db_logger.error(
+                    "Critical low balance",
+                    balance=balance,
+                    currency=currency,
+                    message="Bot cannot create new orders!"
+                )
+            elif balance < 10:
+                logger.warning(f"Low balance warning: ${balance:.2f}")
+                await self.db_logger.warning(
+                    "Low balance warning",
+                    balance=balance,
+                    currency=currency,
+                    message="Consider adding funds"
+                )
+
+        except Exception as e:
+            logger.error(f"Balance check failed: {e}")
 
     async def start(self):
         """Start the bot"""
@@ -404,20 +542,23 @@ class TelegramSMMBot:
             # Start scheduler
             logger.info("Starting scheduler...")
             self.scheduler.start()
-            logger.info("Scheduler started successfully")
+            logger.info("✅ Scheduler started")
 
             # Start telegram bot
             logger.info("Starting Telegram bot...")
             await self.telegram_monitor.start_bot()
-            logger.info("Telegram bot started successfully")
+            logger.info("✅ Telegram bot started")
 
             await self.db_logger.info(
                 "Bot started successfully",
-                scheduled_jobs=len(self.scheduler.get_jobs())
+                scheduled_jobs=len(self.scheduler.get_jobs()),
+                initialization_status=self.init_status
             )
 
-            logger.info("Bot is running. Press Ctrl+C to stop.")
-            logger.info("Entering main loop...")
+            logger.info("=" * 70)
+            logger.info("🟢 BOT IS RUNNING")
+            logger.info("Press Ctrl+C to stop")
+            logger.info("=" * 70)
 
             # Main loop
             loop_counter = 0
@@ -430,7 +571,7 @@ class TelegramSMMBot:
                 # Log heartbeat every minute
                 if loop_counter % 60 == 0:
                     logger.debug(
-                        f"Bot heartbeat",
+                        "Bot heartbeat",
                         uptime_seconds=loop_counter,
                         active_jobs=len(self.scheduler.get_jobs())
                     )
@@ -441,7 +582,7 @@ class TelegramSMMBot:
                     last_stats_log = datetime.utcnow()
 
         except Exception as e:
-            logger.error(f"Error in start: {str(e)}", exc_info=True)
+            logger.error("Error in main loop", error=str(e), exc_info=True)
             raise
 
     async def _log_hourly_stats(self):
@@ -454,7 +595,7 @@ class TelegramSMMBot:
             stats = await queries.get_monitoring_stats()
 
             logger.info(
-                "Hourly statistics",
+                "📊 Hourly statistics",
                 active_channels=stats.get('active_channels', 0),
                 posts_24h=stats.get('posts_24h', 0),
                 orders_24h=stats.get('orders_24h', 0),
@@ -464,7 +605,7 @@ class TelegramSMMBot:
             # Performance metrics
             for metric_name in ['channel_monitoring', 'post_processing', 'status_checking']:
                 metric_stats = self.performance_monitor.get_stats(metric_name)
-                if metric_stats:
+                if metric_stats and metric_stats['count'] > 0:
                     logger.info(
                         f"Performance: {metric_name}",
                         calls=metric_stats['count'],
@@ -477,7 +618,7 @@ class TelegramSMMBot:
 
     async def stop(self):
         """Stop the bot gracefully"""
-        logger.info("Stopping bot...")
+        logger.info("🛑 Stopping bot...")
         self.running = False
 
         try:
@@ -485,13 +626,13 @@ class TelegramSMMBot:
             if self.scheduler:
                 logger.info("Stopping scheduler...")
                 self.scheduler.stop()
-                logger.info("Scheduler stopped")
+                logger.info("✅ Scheduler stopped")
 
             # Stop telegram bot
             if self.telegram_monitor:
                 logger.info("Stopping Telegram bot...")
                 await self.telegram_monitor.stop_bot()
-                logger.info("Telegram bot stopped")
+                logger.info("✅ Telegram bot stopped")
 
             # Log final stats
             uptime = datetime.utcnow() - self.start_time
@@ -503,24 +644,27 @@ class TelegramSMMBot:
 
             # Log shutdown to database
             if self.db_logger:
-                logger.info("Logging shutdown to database...")
                 await self.db_logger.info(
                     "Bot stopping",
                     uptime_hours=uptime.total_seconds() / 3600,
-                    reason="User requested"
+                    reason="User requested",
+                    final_status=self.init_status
                 )
 
             # Close Nakrutka session
-            if self.nakrutka_client and self.nakrutka_client.session:
+            if self.nakrutka_client:
                 logger.info("Closing Nakrutka session...")
-                await self.nakrutka_client.session.close()
+                await self.nakrutka_client.close()
+                logger.info("✅ Nakrutka session closed")
 
             # Close database last
             logger.info("Closing database connection...")
             await self.db.close()
-            logger.info("Database connection closed")
+            logger.info("✅ Database connection closed")
 
-            logger.info("Bot stopped successfully")
+            logger.info("=" * 70)
+            logger.info("🔴 BOT STOPPED")
+            logger.info("=" * 70)
 
         except Exception as e:
             logger.error(f"Error during shutdown: {str(e)}", exc_info=True)
@@ -533,28 +677,43 @@ class TelegramSMMBot:
 
 
 async def main():
-    """Main entry point"""
-    logger.info("=== TELEGRAM SMM BOT STARTING ===")
-    logger.info(f"Python version: {sys.version}")
+    """Main entry point with enhanced initialization"""
+    print("=" * 70)
+    print("🚀 TELEGRAM SMM BOT")
+    print("=" * 70)
+    print(f"Python version: {sys.version}")
+    print(f"Platform: {sys.platform}")
+    print(f"Process ID: {os.getpid()}")
+    print(f"Working directory: {os.getcwd()}")
+    print("=" * 70)
+
+    # Configure logging
+    logger.info("Starting Telegram SMM Bot")
+    logger.info(f"Python {sys.version}")
     logger.info(f"Platform: {sys.platform}")
     logger.info(f"Process ID: {os.getpid()}")
 
     # Log environment info (without sensitive data)
-    logger.info(f"DATABASE_URL configured: {'Yes' if settings.database_url else 'No'}")
-    logger.info(f"NAKRUTKA_API_KEY configured: {'Yes' if settings.nakrutka_api_key else 'No'}")
-    logger.info(f"TELEGRAM_BOT_TOKEN configured: {'Yes' if settings.telegram_bot_token else 'No'}")
-    logger.info(f"Environment: {settings.environment}")
+    env_info = {
+        'DATABASE_URL': 'configured' if settings.database_url else 'missing',
+        'NAKRUTKA_API_KEY': 'configured' if settings.nakrutka_api_key else 'missing',
+        'TELEGRAM_BOT_TOKEN': 'configured' if settings.telegram_bot_token else 'missing',
+        'ENVIRONMENT': settings.environment,
+        'CHECK_INTERVAL': settings.check_interval,
+        'ADMIN_ID': 'configured' if settings.admin_telegram_id else 'not set'
+    }
+    logger.info("Environment configuration", **env_info)
 
     bot = TelegramSMMBot()
 
     # Setup signal handlers
-    signal.signal(signal.SIGINT, bot.handle_signal)
-    signal.signal(signal.SIGTERM, bot.handle_signal)
+    for sig in [signal.SIGINT, signal.SIGTERM]:
+        signal.signal(sig, bot.handle_signal)
     logger.info("Signal handlers configured")
 
     try:
-        # Setup bot
-        logger.info("Starting bot setup...")
+        # Setup bot with all initialization
+        logger.info("Initializing bot...")
         await bot.setup()
 
         # Start bot
@@ -562,37 +721,38 @@ async def main():
         await bot.start()
 
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
+        logger.info("⌨️ Keyboard interrupt received")
     except Exception as e:
-        logger.error(f"Bot crashed: {str(e)}", error=str(e), exc_info=True)
+        logger.error(f"💥 Bot crashed: {str(e)}", error=str(e), exc_info=True)
         if bot.db_logger:
             try:
                 await bot.db_logger.error(
                     "Bot crashed",
                     error=str(e),
-                    error_type=type(e).__name__
+                    error_type=type(e).__name__,
+                    traceback=True
                 )
             except:
                 logger.error("Failed to log crash to database")
+        print(f"\n❌ FATAL ERROR: {str(e)}")
+        print("Check logs for details")
     finally:
         logger.info("Shutting down...")
         await bot.stop()
-        logger.info("=== TELEGRAM SMM BOT STOPPED ===")
+        print("\n👋 Bot stopped")
 
 
 if __name__ == "__main__":
-    logger.info("Script started directly")
+    print("Starting bot...")
 
     # Windows event loop policy fix
     if sys.platform == "win32":
-        logger.info("Windows detected, setting event loop policy")
+        print("Windows detected, setting event loop policy")
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     # Run bot
-    logger.info("Starting asyncio event loop...")
-
     try:
         asyncio.run(main())
     except Exception as e:
-        logger.error(f"Failed to run bot: {e}")
+        print(f"\n❌ Failed to run bot: {e}")
         sys.exit(1)

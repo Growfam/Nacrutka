@@ -1,14 +1,16 @@
 """
-Telegram channel monitoring service - Complete implementation
+Telegram channel monitoring service with Nakrutka integration
 """
 from typing import List, Optional, Dict, Any, Set
 from datetime import datetime, timedelta
 import asyncio
 import re
+import html
 
 from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError, BadRequest, Forbidden
+from telegram.constants import ParseMode
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.errors import SessionPasswordNeededError
@@ -17,21 +19,32 @@ from src.config import settings
 from src.database.connection import DatabaseConnection
 from src.database.queries import Queries
 from src.database.models import Channel, Post
+from src.services.nakrutka import NakrutkaClient
 from src.utils.logger import get_logger, DatabaseLogger
-from src.utils.helpers import validate_telegram_channel_id, format_number, format_price
+from src.utils.helpers import (
+    validate_telegram_channel_id,
+    format_number,
+    format_price,
+    truncate_text,
+    format_duration
+)
 
 logger = get_logger(__name__)
 
 
 class TelegramMonitor:
-    """Monitors Telegram channels for new posts"""
+    """Monitors Telegram channels for new posts with Nakrutka integration"""
 
-    def __init__(self, db: DatabaseConnection):
+    def __init__(self, db: DatabaseConnection, nakrutka_client: Optional[NakrutkaClient] = None):
         self.db = db
         self.queries = Queries(db)
         self.db_logger = DatabaseLogger(db)
         self.bot = Bot(token=settings.telegram_bot_token)
         self.app: Optional[Application] = None
+        self.nakrutka_client = nakrutka_client
+
+        # Start time for uptime calculation
+        self.start_time = datetime.utcnow()
 
         # Cache for channel posts to avoid duplicates
         self._channel_cache: Dict[int, Set[int]] = {}
@@ -41,6 +54,13 @@ class TelegramMonitor:
         # Rate limiting
         self._last_check: Dict[int, datetime] = {}
         self._min_check_interval = 20  # seconds between channel checks
+
+        # Error tracking
+        self._channel_errors: Dict[int, List[str]] = {}
+        self._max_errors_per_channel = 5
+
+        # Admin commands tracking
+        self._admin_commands_count = 0
 
     async def setup_bot(self):
         """Setup telegram bot handlers"""
@@ -52,7 +72,18 @@ class TelegramMonitor:
         self.app.add_handler(CommandHandler("stats", self.cmd_stats))
         self.app.add_handler(CommandHandler("channels", self.cmd_channels))
         self.app.add_handler(CommandHandler("costs", self.cmd_costs))
+        self.app.add_handler(CommandHandler("balance", self.cmd_balance))
+        self.app.add_handler(CommandHandler("orders", self.cmd_orders))
+        self.app.add_handler(CommandHandler("errors", self.cmd_errors))
+        self.app.add_handler(CommandHandler("cache", self.cmd_cache))
+        self.app.add_handler(CommandHandler("health", self.cmd_health))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
+
+        # Add message handler for non-command messages
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+
+        # Error handler
+        self.app.add_error_handler(self.error_handler)
 
         logger.info("Telegram bot handlers configured")
 
@@ -64,10 +95,24 @@ class TelegramMonitor:
 
             # Start polling in background
             asyncio.create_task(self.app.updater.start_polling(
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True
             ))
 
-            logger.info("Telegram bot started for commands")
+            # Log bot info
+            bot_info = await self.bot.get_me()
+            logger.info(
+                "Telegram bot started",
+                username=bot_info.username,
+                bot_id=bot_info.id,
+                can_read_all_group_messages=bot_info.can_read_all_group_messages
+            )
+
+            await self.db_logger.info(
+                "Telegram bot started",
+                username=bot_info.username,
+                bot_id=bot_info.id
+            )
 
     async def stop_bot(self):
         """Stop telegram bot"""
@@ -90,6 +135,15 @@ class TelegramMonitor:
             # Process channels with rate limiting
             results = []
             for channel in channels:
+                # Check if channel has too many errors
+                channel_errors = self._channel_errors.get(channel.id, [])
+                if len(channel_errors) >= self._max_errors_per_channel:
+                    logger.warning(
+                        f"Skipping {channel.channel_username} - too many errors",
+                        error_count=len(channel_errors)
+                    )
+                    continue
+
                 # Check rate limit
                 last_check = self._last_check.get(channel.id)
                 if last_check:
@@ -106,6 +160,10 @@ class TelegramMonitor:
                     results.append(result)
                     self._last_check[channel.id] = datetime.utcnow()
 
+                    # Clear errors on success
+                    if channel.id in self._channel_errors:
+                        del self._channel_errors[channel.id]
+
                     # Small delay between channels
                     await asyncio.sleep(1)
 
@@ -113,16 +171,30 @@ class TelegramMonitor:
                     logger.error(
                         f"Error checking channel {channel.channel_username}",
                         error=str(e),
-                        channel_id=channel.id
+                        channel_id=channel.id,
+                        exc_info=True
                     )
+
+                    # Track error
+                    if channel.id not in self._channel_errors:
+                        self._channel_errors[channel.id] = []
+                    self._channel_errors[channel.id].append(str(e))
+
                     results.append(None)
 
             # Count results
             new_posts = sum(r or 0 for r in results if isinstance(r, int))
             errors = sum(1 for r in results if r is None)
+            skipped = len(channels) - len(results)
 
             if new_posts > 0:
-                logger.info(f"Found {new_posts} new posts across all channels")
+                logger.info(
+                    f"Channel check completed",
+                    new_posts=new_posts,
+                    channels_checked=len(results),
+                    errors=errors,
+                    skipped=skipped
+                )
                 await self.db_logger.info(
                     "New posts found",
                     count=new_posts,
@@ -136,7 +208,8 @@ class TelegramMonitor:
             logger.error("Failed to check channels", error=str(e), exc_info=True)
             await self.db_logger.error(
                 "Channel check failed",
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__
             )
 
     async def check_channel(self, channel: Channel) -> Optional[int]:
@@ -148,17 +221,17 @@ class TelegramMonitor:
             recent_posts = await self.get_channel_posts(
                 channel.channel_username,
                 channel.channel_id,
-                limit=30  # Check last 30 posts
+                limit=50  # Check last 50 posts
             )
 
             if not recent_posts:
                 logger.debug(f"No posts found in {channel.channel_username}")
                 return 0
 
-            # Get existing posts from DB (last 500 to be safe)
+            # Get existing posts from DB (last 1000 to be safe)
             existing_posts = await self.queries.get_channel_posts(
                 channel.id,
-                limit=500
+                limit=1000
             )
             existing_set = set(existing_posts)
 
@@ -212,7 +285,6 @@ class TelegramMonitor:
                 channel_id=channel.id,
                 exc_info=True
             )
-
             # Don't propagate error - continue with other channels
             return None
 
@@ -234,7 +306,7 @@ class TelegramMonitor:
             if cache_age.total_seconds() < self._cache_ttl:
                 cached_posts = list(self._channel_cache[cache_key])
                 logger.debug(f"Using cached posts for {username}: {len(cached_posts)} posts")
-                return cached_posts[-limit:]
+                return sorted(cached_posts)[-limit:]
 
         try:
             posts = []
@@ -259,19 +331,20 @@ class TelegramMonitor:
                 self._channel_cache[cache_key].update(posts)
                 self._cache_updated[cache_key] = datetime.utcnow()
 
-                # Clean old posts from cache (keep last 1000)
-                if len(self._channel_cache[cache_key]) > 1000:
+                # Clean old posts from cache (keep last 2000)
+                if len(self._channel_cache[cache_key]) > 2000:
                     sorted_posts = sorted(self._channel_cache[cache_key])
-                    self._channel_cache[cache_key] = set(sorted_posts[-1000:])
+                    self._channel_cache[cache_key] = set(sorted_posts[-2000:])
 
             logger.debug(f"Found {len(posts)} posts in {username}")
-            return posts[-limit:]
+            return sorted(posts)[-limit:]
 
         except Exception as e:
             logger.error(
                 f"Failed to get posts from {username}",
                 error=str(e),
-                channel_id=channel_id
+                channel_id=channel_id,
+                exc_info=True
             )
             return []
 
@@ -285,11 +358,17 @@ class TelegramMonitor:
             try:
                 chat = await self.bot.get_chat(f"@{username}")
                 logger.debug(f"Got chat info for @{username}: {chat.type}")
-            except (BadRequest, Forbidden) as e:
-                logger.debug(f"Cannot access @{username}: {e}")
-                return []
 
-            # Parse from web as fallback
+                # If we can access the chat, we might be able to get some recent messages
+                # This is limited but better than nothing
+                if hasattr(chat, 'linked_chat_id') and chat.linked_chat_id:
+                    # Try to get from linked chat
+                    pass
+
+            except (BadRequest, Forbidden) as e:
+                logger.debug(f"Cannot access @{username} via bot API: {e}")
+
+            # Parse from web as primary method for public channels
             return await self._get_channel_posts_from_web(username, limit)
 
         except Exception as e:
@@ -300,19 +379,18 @@ class TelegramMonitor:
         """Get posts from private channel where bot is admin"""
         try:
             # This only works if bot is admin in channel
-            # Try to get recent messages
-            updates = await self.bot.get_updates(
-                offset=-1,
-                limit=100,
-                allowed_updates=["channel_post"]
-            )
+            # Try to get chat to verify access
+            try:
+                chat = await self.bot.get_chat(channel_id)
+                logger.debug(f"Bot has access to channel {channel_id}: {chat.title}")
+            except (BadRequest, Forbidden):
+                logger.debug(f"Bot doesn't have access to channel {channel_id}")
+                return []
 
-            posts = []
-            for update in updates:
-                if update.channel_post and update.channel_post.chat.id == channel_id:
-                    posts.append(update.channel_post.message_id)
-
-            return posts[-limit:]
+            # Unfortunately, Bot API doesn't have a direct method to get message history
+            # We would need to use MTProto (Telethon) for this
+            # For now, return empty and rely on web parsing
+            return []
 
         except Exception as e:
             logger.debug(f"Cannot get private channel posts: {e}")
@@ -327,23 +405,43 @@ class TelegramMonitor:
             url = f"https://t.me/s/{username}"
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 404:
+                        logger.warning(f"Channel not found: {username}")
+                        return []
+
                     if response.status != 200:
                         logger.warning(f"Failed to fetch {url}: {response.status}")
                         return []
 
-                    html = await response.text()
+                    html_content = await response.text()
 
             # Parse HTML
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(html_content, 'html.parser')
 
-            # Find message links
+            # Find message containers
             posts = []
-            for link in soup.find_all('a', href=re.compile(rf't\.me/{username}/\d+')):
-                match = re.search(rf't\.me/{username}/(\d+)', link.get('href', ''))
-                if match:
-                    post_id = int(match.group(1))
-                    posts.append(post_id)
+
+            # Look for message divs with data-post attribute
+            for message in soup.find_all('div', {'class': 'tgme_widget_message'}):
+                post_attr = message.get('data-post')
+                if post_attr:
+                    # Extract post ID from data-post attribute (format: channel/123)
+                    parts = post_attr.split('/')
+                    if len(parts) == 2 and parts[1].isdigit():
+                        posts.append(int(parts[1]))
+
+            # Alternative: find links to posts
+            if not posts:
+                for link in soup.find_all('a', href=re.compile(rf't\.me/{username}/\d+')):
+                    match = re.search(rf't\.me/{username}/(\d+)', link.get('href', ''))
+                    if match:
+                        post_id = int(match.group(1))
+                        if post_id not in posts:
+                            posts.append(post_id)
 
             # Remove duplicates and sort
             posts = sorted(list(set(posts)))
@@ -352,32 +450,26 @@ class TelegramMonitor:
             return posts[-limit:]
 
         except Exception as e:
-            logger.error(f"Failed to parse web posts: {e}")
+            logger.error(f"Failed to parse web posts: {e}", exc_info=True)
             return []
 
-    async def get_post_info(self, channel_id: int, post_id: int) -> Dict[str, Any]:
-        """Get detailed post information"""
-        try:
-            # Try to get message info if bot has access
-            # This is limited and may not work for all channels
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors in telegram bot"""
+        logger.error(
+            "Exception while handling an update",
+            error=str(context.error),
+            exc_info=context.error
+        )
 
+        # Notify admin about error
+        if settings.admin_telegram_id and update and hasattr(update, 'effective_message'):
             try:
-                # Try forwarding to get info (then delete)
-                # This is a workaround but not recommended for production
-                pass
+                await context.bot.send_message(
+                    chat_id=settings.admin_telegram_id,
+                    text=f"⚠️ Error: {str(context.error)[:200]}"
+                )
             except:
                 pass
-
-            # Return basic info
-            return {
-                'post_id': post_id,
-                'channel_id': channel_id,
-                'timestamp': datetime.utcnow()
-            }
-
-        except Exception as e:
-            logger.error("Failed to get post info", error=str(e))
-            return {}
 
     # ============ BOT COMMANDS ============
 
@@ -387,29 +479,40 @@ class TelegramMonitor:
             await update.message.reply_text("❌ Unauthorized")
             return
 
+        self._admin_commands_count += 1
+
         welcome_message = (
-            "🤖 *Telegram SMM Bot*\n\n"
+            "🤖 <b>Telegram SMM Bot</b>\n\n"
             "Автоматична система накрутки для Telegram каналів\n\n"
-            "*Команди:*\n"
+            "<b>Основні команди:</b>\n"
             "/status - Статус системи\n"
             "/channels - Список каналів\n"
             "/stats - Статистика по каналах\n"
-            "/costs - Витрати за сьогодні\n"
-            "/help - Допомога\n\n"
-            "_Бот працює 24/7 в автоматичному режимі_"
+            "/costs - Витрати на накрутку\n"
+            "/balance - Баланс Nakrutka\n"
+            "/orders - Активні замовлення\n"
+            "/errors - Помилки системи\n"
+            "/health - Перевірка здоров'я\n"
+            "/help - Детальна допомога\n\n"
+            "<i>Бот працює 24/7 в автоматичному режимі</i>"
         )
 
         await update.message.reply_text(
             welcome_message,
-            parse_mode='Markdown'
+            parse_mode=ParseMode.HTML
         )
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /status command"""
+        """Handle /status command with Nakrutka integration"""
         if not self._is_admin(update.effective_user.id):
             return
 
+        self._admin_commands_count += 1
+
         try:
+            # Send initial message
+            msg = await update.message.reply_text("⏳ Збираю інформацію...")
+
             # Get system status
             channels = await self.queries.get_active_channels()
 
@@ -432,40 +535,62 @@ class TelegramMonitor:
 
             post_stats = {row['status']: row['count'] for row in recent_posts}
 
-            # Get Nakrutka balance
-            try:
-                balance = await self.nakrutka.get_balance()
-                balance_text = f"${balance.get('balance', 0)} {balance.get('currency', 'USD')}"
-            except:
-                balance_text = "N/A"
+            # Calculate uptime
+            uptime = datetime.utcnow() - self.start_time
+            uptime_str = format_duration(int(uptime.total_seconds()))
 
+            # Get Nakrutka balance if client available
+            balance_text = "N/A"
+            if self.nakrutka_client:
+                try:
+                    balance_info = await self.nakrutka_client.get_balance()
+                    balance = balance_info.get('balance', 0)
+                    currency = balance_info.get('currency', 'USD')
+                    balance_text = f"${balance:.2f} {currency}"
+
+                    # Add warning if low
+                    if balance < 10:
+                        balance_text += " ⚠️"
+                    elif balance < 1:
+                        balance_text += " ❌"
+                except Exception as e:
+                    logger.error(f"Failed to get Nakrutka balance: {e}")
+                    balance_text = "Error ❌"
+            else:
+                balance_text = "Not configured ⚠️"
+
+            # Format message
             message = (
-                "📊 *Статус системи*\n\n"
+                "📊 <b>Статус системи</b>\n\n"
+                f"⏱ Uptime: {uptime_str}\n"
                 f"✅ Активних каналів: {len(channels)}\n"
                 f"📝 Активних замовлень: {len(active_orders)}\n\n"
-                f"*Пости за 24 години:*\n"
+                f"<b>Пости за 24 години:</b>\n"
                 f"🆕 Нові: {post_stats.get('new', 0)}\n"
                 f"⏳ В обробці: {post_stats.get('processing', 0)}\n"
                 f"✅ Завершені: {post_stats.get('completed', 0)}\n"
                 f"❌ Помилки: {post_stats.get('failed', 0)}\n\n"
-                f"*Витрати сьогодні:*\n"
+                f"<b>Витрати сьогодні:</b>\n"
                 f"👁 Перегляди: ${today_costs.get('views', 0):.2f}\n"
                 f"❤️ Реакції: ${today_costs.get('reactions', 0):.2f}\n"
                 f"🔄 Репости: ${today_costs.get('reposts', 0):.2f}\n"
                 f"💰 Всього: ${total_cost:.2f}\n\n"
-                f"*Баланс Nakrutka:* {balance_text}"
+                f"<b>Баланс Nakrutka:</b> {balance_text}\n\n"
+                f"<i>Оновлено: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
             )
 
-            await update.message.reply_text(message, parse_mode='Markdown')
+            await msg.edit_text(message, parse_mode=ParseMode.HTML)
 
         except Exception as e:
-            logger.error("Failed to get status", error=str(e))
+            logger.error("Failed to get status", error=str(e), exc_info=True)
             await update.message.reply_text("❌ Помилка отримання статусу")
 
     async def cmd_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /channels command"""
         if not self._is_admin(update.effective_user.id):
             return
+
+        self._admin_commands_count += 1
 
         try:
             channels = await self.queries.get_active_channels()
@@ -474,44 +599,65 @@ class TelegramMonitor:
                 await update.message.reply_text("📢 Немає активних каналів")
                 return
 
-            message = "📢 *Активні канали:*\n\n"
+            message = "📢 <b>Активні канали:</b>\n\n"
 
-            for channel in channels:
+            for i, channel in enumerate(channels, 1):
                 # Get settings
                 settings = await self.queries.get_channel_settings(channel.id)
 
-                # Get post count
-                post_count = await self.db.fetchval(
-                    "SELECT COUNT(*) FROM posts WHERE channel_id = $1",
-                    channel.id
-                )
+                # Get stats
+                stats = await self.queries.get_channel_stats(channel.id)
+
+                # Check cache status
+                is_cached = channel.id in self._channel_cache
+                cache_size = len(self._channel_cache.get(channel.id, [])) if is_cached else 0
 
                 message += (
-                    f"*{channel.channel_username}*\n"
-                    f"├ ID: `{channel.channel_id}`\n"
-                    f"├ Постів: {post_count}\n"
+                    f"<b>{i}. {channel.channel_username}</b>\n"
+                    f"├ ID: <code>{channel.channel_id}</code>\n"
+                    f"├ Постів: {stats.get('total_posts', 0)} "
+                    f"(24h: {stats.get('posts_24h', 0)})\n"
                 )
 
                 if settings:
                     message += (
-                        f"├ Перегляди: {format_number(settings.views_target)}\n"
-                        f"├ Реакції: {format_number(settings.reactions_target)}"
+                        f"├ 👁 {format_number(settings.views_target)}"
                     )
-                    if settings.randomize_reactions:
-                        message += f" (±{settings.randomize_percent}%)"
+                    if settings.views_target > 0:
+                        message += " ✓"
                     message += "\n"
 
-                    message += f"└ Репости: {format_number(settings.reposts_target)}"
+                    message += f"├ ❤️ {format_number(settings.reactions_target)}"
+                    if settings.randomize_reactions:
+                        message += f" (±{settings.randomize_percent}%)"
+                    if settings.reactions_target > 0:
+                        message += " ✓"
+                    message += "\n"
+
+                    message += f"├ 🔄 {format_number(settings.reposts_target)}"
                     if settings.randomize_reposts:
                         message += f" (±{settings.randomize_percent}%)"
-                    message += "\n\n"
+                    if settings.reposts_target > 0:
+                        message += " ✓"
+                    message += "\n"
                 else:
-                    message += "└ ⚠️ Налаштування відсутні\n\n"
+                    message += "├ ⚠️ Налаштування відсутні\n"
 
-            await update.message.reply_text(message, parse_mode='Markdown')
+                # Add cache info
+                if is_cached:
+                    message += f"└ 💾 Cache: {cache_size} posts\n\n"
+                else:
+                    message += "└ 💾 Cache: empty\n\n"
+
+                # Limit message size
+                if len(message) > 3500:
+                    message += f"<i>...та ще {len(channels) - i} каналів</i>"
+                    break
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
         except Exception as e:
-            logger.error("Failed to get channels", error=str(e))
+            logger.error("Failed to get channels", error=str(e), exc_info=True)
             await update.message.reply_text("❌ Помилка отримання каналів")
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,32 +665,41 @@ class TelegramMonitor:
         if not self._is_admin(update.effective_user.id):
             return
 
+        self._admin_commands_count += 1
+
         try:
             channels = await self.queries.get_active_channels()
 
-            message = "📈 *Статистика по каналах*\n\n"
+            message = "📈 <b>Статистика по каналах</b>\n\n"
 
             total_posts = 0
             total_completed = 0
+            total_views = 0
+            total_reactions = 0
+            total_reposts = 0
 
             for channel in channels[:10]:  # Limit to 10
                 stats = await self.queries.get_channel_stats(channel.id)
 
-                total_posts += stats['total_posts']
-                total_completed += stats['completed_posts']
+                total_posts += stats.get('total_posts', 0)
+                total_completed += stats.get('completed_posts', 0)
+                total_views += stats.get('total_views', 0)
+                total_reactions += stats.get('total_reactions', 0)
+                total_reposts += stats.get('total_reposts', 0)
 
                 success_rate = (
                     stats['completed_posts'] / stats['total_posts'] * 100
-                    if stats['total_posts'] > 0 else 0
+                    if stats.get('total_posts', 0) > 0 else 0
                 )
 
                 message += (
-                    f"📢 *{channel.channel_username}*\n"
-                    f"├ Всього постів: {stats['total_posts']}\n"
-                    f"├ Завершено: {stats['completed_posts']}\n"
-                    f"├ В обробці: {stats['processing_posts']}\n"
-                    f"├ Помилки: {stats['failed_posts']}\n"
-                    f"└ Успішність: {success_rate:.1f}%\n\n"
+                    f"📢 <b>{channel.channel_username}</b>\n"
+                    f"├ Всього постів: {stats.get('total_posts', 0)}\n"
+                    f"├ Завершено: {stats.get('completed_posts', 0)}\n"
+                    f"├ В обробці: {stats.get('processing_posts', 0)}\n"
+                    f"├ Помилки: {stats.get('failed_posts', 0)}\n"
+                    f"├ Успішність: {success_rate:.1f}%\n"
+                    f"└ За 7 днів: {stats.get('posts_7d', 0)} постів\n\n"
                 )
 
             # Overall stats
@@ -554,22 +709,27 @@ class TelegramMonitor:
             )
 
             message += (
-                f"*Загальна статистика:*\n"
-                f"├ Всього постів: {total_posts}\n"
-                f"├ Успішно оброблено: {total_completed}\n"
-                f"└ Загальна успішність: {overall_success:.1f}%"
+                f"<b>Загальна статистика:</b>\n"
+                f"├ Всього постів: {format_number(total_posts)}\n"
+                f"├ Успішно оброблено: {format_number(total_completed)}\n"
+                f"├ Загальна успішність: {overall_success:.1f}%\n"
+                f"├ 👁 Переглядів: {format_number(total_views)}\n"
+                f"├ ❤️ Реакцій: {format_number(total_reactions)}\n"
+                f"└ 🔄 Репостів: {format_number(total_reposts)}"
             )
 
-            await update.message.reply_text(message, parse_mode='Markdown')
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
         except Exception as e:
-            logger.error("Failed to get stats", error=str(e))
+            logger.error("Failed to get stats", error=str(e), exc_info=True)
             await update.message.reply_text("❌ Помилка отримання статистики")
 
     async def cmd_costs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /costs command"""
         if not self._is_admin(update.effective_user.id):
             return
+
+        self._admin_commands_count += 1
 
         try:
             # Today's costs
@@ -590,21 +750,31 @@ class TelegramMonitor:
                 """
             )
 
+            # This month's costs
+            month_total = await self.db.fetchval(
+                """
+                SELECT SUM(o.total_quantity * s.price_per_1000 / 1000)
+                FROM orders o
+                JOIN services s ON s.nakrutka_id = o.service_id
+                WHERE DATE_TRUNC('month', o.created_at) = DATE_TRUNC('month', CURRENT_DATE)
+                """
+            ) or 0
+
             # Format message
-            message = "💰 *Витрати на накрутку*\n\n"
+            message = "💰 <b>Витрати на накрутку</b>\n\n"
 
             # Today
             today_total = sum(today_costs.values())
             message += (
-                f"*Сьогодні:*\n"
-                f"├ Перегляди: {format_price(today_costs.get('views', 0))}\n"
-                f"├ Реакції: {format_price(today_costs.get('reactions', 0))}\n"
-                f"├ Репости: {format_price(today_costs.get('reposts', 0))}\n"
-                f"└ Всього: {format_price(today_total)}\n\n"
+                f"<b>Сьогодні:</b>\n"
+                f"├ 👁 Перегляди: {format_price(today_costs.get('views', 0))}\n"
+                f"├ ❤️ Реакції: {format_price(today_costs.get('reactions', 0))}\n"
+                f"├ 🔄 Репости: {format_price(today_costs.get('reposts', 0))}\n"
+                f"└ 💰 Всього: <b>{format_price(today_total)}</b>\n\n"
             )
 
             # Week by day
-            message += "*За тиждень:*\n"
+            message += "<b>За тиждень:</b>\n"
 
             daily_totals = {}
             for row in week_costs:
@@ -613,47 +783,422 @@ class TelegramMonitor:
                     daily_totals[date] = 0
                 daily_totals[date] += float(row['cost'])
 
+            days_shown = 0
             for date, total in list(daily_totals.items())[:7]:
-                message += f"├ {date}: {format_price(total)}\n"
+                if days_shown < 6:
+                    message += f"├ {date}: {format_price(total)}\n"
+                else:
+                    message += f"└ {date}: {format_price(total)}\n"
+                days_shown += 1
 
             week_total = sum(daily_totals.values())
-            message += f"└ Всього за тиждень: {format_price(week_total)}"
+            message += f"\n<b>Всього за тиждень:</b> {format_price(week_total)}\n"
+            message += f"<b>Всього за місяць:</b> {format_price(float(month_total))}\n\n"
 
-            await update.message.reply_text(message, parse_mode='Markdown')
+            # Average per day
+            if daily_totals:
+                avg_daily = week_total / len(daily_totals)
+                message += f"<i>Середньо за день: {format_price(avg_daily)}</i>"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
         except Exception as e:
-            logger.error("Failed to get costs", error=str(e))
+            logger.error("Failed to get costs", error=str(e), exc_info=True)
             await update.message.reply_text("❌ Помилка отримання витрат")
+
+    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /balance command"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        self._admin_commands_count += 1
+
+        if not self.nakrutka_client:
+            await update.message.reply_text("❌ Nakrutka client не налаштований")
+            return
+
+        try:
+            # Get balance
+            balance_info = await self.nakrutka_client.get_balance()
+            balance = float(balance_info.get('balance', 0))
+            currency = balance_info.get('currency', 'USD')
+
+            # Get today's spending
+            today_costs = await self.queries.get_today_costs()
+            today_total = sum(today_costs.values())
+
+            # Calculate days remaining at current rate
+            days_remaining = "∞"
+            if today_total > 0:
+                days_remaining = f"{int(balance / today_total)}"
+
+            # Get account info
+            services = await self.nakrutka_client.get_services()
+            service_count = len(services) if services else 0
+
+            # Format message
+            status_emoji = "✅" if balance >= 10 else "⚠️" if balance >= 1 else "❌"
+
+            message = (
+                f"💰 <b>Баланс Nakrutka</b> {status_emoji}\n\n"
+                f"<b>Поточний баланс:</b> ${balance:.2f} {currency}\n"
+                f"<b>Витрати сьогодні:</b> ${today_total:.2f}\n"
+                f"<b>Днів залишилось:</b> {days_remaining}\n"
+                f"<b>Доступно сервісів:</b> {service_count}\n\n"
+            )
+
+            # Add warnings
+            if balance < 1:
+                message += "❌ <b>КРИТИЧНО!</b> Баланс майже вичерпано!\n"
+            elif balance < 10:
+                message += "⚠️ <b>Увага!</b> Низький баланс, потрібно поповнити.\n"
+            elif balance < today_total * 3:
+                message += "💡 <i>Рекомендую поповнити баланс найближчим часом.</i>\n"
+
+            # Add cache stats
+            cache_stats = self.nakrutka_client.get_cache_stats()
+            message += f"\n<i>Cache: {cache_stats['cache_size']} items</i>"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error("Failed to get balance", error=str(e), exc_info=True)
+            await update.message.reply_text(f"❌ Помилка: {str(e)[:100]}")
+
+    async def cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /orders command"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            # Get active orders
+            active_orders = await self.queries.get_active_orders()
+
+            if not active_orders:
+                await update.message.reply_text("📝 Немає активних замовлень")
+                return
+
+            message = f"📝 <b>Активні замовлення ({len(active_orders)})</b>\n\n"
+
+            # Group by service type
+            by_type = {
+                'views': [],
+                'reactions': [],
+                'reposts': []
+            }
+
+            for order in active_orders:
+                by_type.get(order.service_type, []).append(order)
+
+            # Show orders by type
+            for service_type, orders in by_type.items():
+                if not orders:
+                    continue
+
+                emoji = {
+                    'views': '👁',
+                    'reactions': '❤️',
+                    'reposts': '🔄'
+                }.get(service_type, '❓')
+
+                message += f"<b>{emoji} {service_type.capitalize()} ({len(orders)}):</b>\n"
+
+                for order in orders[:5]:  # Limit to 5 per type
+                    # Get post info
+                    post = await self.queries.get_post_by_id(order.post_id)
+
+                    # Format order info
+                    age = (datetime.utcnow() - order.created_at).total_seconds() / 60
+                    age_str = f"{int(age)}m ago"
+
+                    status_emoji = "⏳" if order.status == "pending" else "▶️"
+
+                    message += (
+                        f"{status_emoji} {format_number(order.total_quantity)} "
+                        f"• {age_str}"
+                    )
+
+                    if order.nakrutka_order_id:
+                        message += f" • #{order.nakrutka_order_id[:8]}..."
+
+                    message += "\n"
+
+                if len(orders) > 5:
+                    message += f"<i>...та ще {len(orders) - 5}</i>\n"
+
+                message += "\n"
+
+            # Add summary
+            total_quantity = {
+                'views': sum(o.total_quantity for o in by_type['views']),
+                'reactions': sum(o.total_quantity for o in by_type['reactions']),
+                'reposts': sum(o.total_quantity for o in by_type['reposts'])
+            }
+
+            message += (
+                f"<b>Всього в обробці:</b>\n"
+                f"👁 {format_number(total_quantity['views'])} | "
+                f"❤️ {format_number(total_quantity['reactions'])} | "
+                f"🔄 {format_number(total_quantity['reposts'])}"
+            )
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error("Failed to get orders", error=str(e), exc_info=True)
+            await update.message.reply_text("❌ Помилка отримання замовлень")
+
+    async def cmd_errors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /errors command"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            # Get recent error logs
+            error_logs = await self.queries.get_recent_logs(level='error', limit=20)
+
+            if not error_logs:
+                await update.message.reply_text("✅ Немає помилок за останній час")
+                return
+
+            message = "❌ <b>Останні помилки системи</b>\n\n"
+
+            # Group errors by type
+            error_types = {}
+            for log in error_logs:
+                error_type = log.context.get('error_type', 'Unknown')
+                if error_type not in error_types:
+                    error_types[error_type] = []
+                error_types[error_type].append(log)
+
+            # Show errors by type
+            for error_type, errors in list(error_types.items())[:5]:
+                message += f"<b>{error_type} ({len(errors)}):</b>\n"
+
+                for error in errors[:3]:
+                    time_ago = datetime.utcnow() - error.created_at
+                    time_str = format_duration(int(time_ago.total_seconds()))
+
+                    error_msg = truncate_text(error.message, 50)
+                    message += f"• {error_msg} ({time_str} ago)\n"
+
+                message += "\n"
+
+            # Channel errors
+            if self._channel_errors:
+                message += f"<b>Канали з помилками ({len(self._channel_errors)}):</b>\n"
+                for channel_id, errors in list(self._channel_errors.items())[:5]:
+                    channel = await self.queries.get_channel_by_id(channel_id)
+                    if channel:
+                        message += f"• {channel.channel_username}: {len(errors)} errors\n"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error("Failed to get errors", error=str(e), exc_info=True)
+            await update.message.reply_text("❌ Помилка отримання логів")
+
+    async def cmd_cache(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cache command"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            # Channel cache stats
+            total_cached_posts = sum(len(posts) for posts in self._channel_cache.values())
+
+            message = "💾 <b>Статистика кешу</b>\n\n"
+
+            message += f"<b>Канали в кеші:</b> {len(self._channel_cache)}\n"
+            message += f"<b>Всього постів в кеші:</b> {format_number(total_cached_posts)}\n\n"
+
+            # Show cache details for each channel
+            if self._channel_cache:
+                message += "<b>Деталі по каналах:</b>\n"
+
+                for channel_id, posts in list(self._channel_cache.items())[:10]:
+                    channel = await self.queries.get_channel_by_id(channel_id)
+                    if channel:
+                        cache_age = datetime.utcnow() - self._cache_updated.get(channel_id, datetime.min)
+                        age_str = format_duration(int(cache_age.total_seconds()))
+
+                        message += (
+                            f"• {channel.channel_username}: "
+                            f"{len(posts)} posts, age: {age_str}\n"
+                        )
+
+            # Nakrutka cache stats
+            if self.nakrutka_client:
+                nakrutka_stats = self.nakrutka_client.get_cache_stats()
+                message += (
+                    f"\n<b>Nakrutka cache:</b>\n"
+                    f"├ Items: {nakrutka_stats['cache_size']}\n"
+                    f"├ Service limits: {nakrutka_stats['service_limits_cache_size']}\n"
+                    f"└ Keys: {', '.join(nakrutka_stats['cache_keys'])}\n"
+                )
+
+            # Admin commands count
+            message += f"\n<i>Admin commands used: {self._admin_commands_count}</i>"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error("Failed to get cache stats", error=str(e), exc_info=True)
+            await update.message.reply_text("❌ Помилка отримання статистики кешу")
+
+    async def cmd_health(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /health command"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        self._admin_commands_count += 1
+
+        msg = await update.message.reply_text("🔍 Перевіряю систему...")
+
+        try:
+            health_status = {
+                'database': '❓',
+                'nakrutka': '❓',
+                'telegram': '❓',
+                'scheduler': '❓'
+            }
+
+            # Check database
+            try:
+                db_test = await self.db.fetchval("SELECT 1")
+                health_status['database'] = '✅' if db_test == 1 else '❌'
+            except:
+                health_status['database'] = '❌'
+
+            # Check Nakrutka
+            if self.nakrutka_client:
+                try:
+                    health = await self.nakrutka_client.health_check()
+                    if health['status'] == 'healthy':
+                        health_status['nakrutka'] = '✅'
+                    elif health['status'] == 'auth_error':
+                        health_status['nakrutka'] = '🔑'
+                    else:
+                        health_status['nakrutka'] = '❌'
+                except:
+                    health_status['nakrutka'] = '❌'
+            else:
+                health_status['nakrutka'] = '⚠️'
+
+            # Check Telegram bot
+            try:
+                bot_info = await self.bot.get_me()
+                health_status['telegram'] = '✅' if bot_info else '❌'
+            except:
+                health_status['telegram'] = '❌'
+
+            # Check scheduler (assumed OK if we're running)
+            health_status['scheduler'] = '✅'
+
+            # Format message
+            message = "🏥 <b>Перевірка здоров'я системи</b>\n\n"
+
+            for component, status in health_status.items():
+                message += f"{status} <b>{component.capitalize()}</b>\n"
+
+            # Add details if issues found
+            if '❌' in health_status.values() or '⚠️' in health_status.values():
+                message += "\n<b>Деталі проблем:</b>\n"
+
+                if health_status['database'] == '❌':
+                    message += "• База даних не відповідає\n"
+
+                if health_status['nakrutka'] == '❌':
+                    message += "• Nakrutka API недоступний\n"
+                elif health_status['nakrutka'] == '🔑':
+                    message += "• Проблема з API ключем Nakrutka\n"
+                elif health_status['nakrutka'] == '⚠️':
+                    message += "• Nakrutka client не налаштований\n"
+
+                if health_status['telegram'] == '❌':
+                    message += "• Telegram Bot API недоступний\n"
+
+            # Overall status
+            all_ok = all(s == '✅' for s in health_status.values())
+            if all_ok:
+                message += "\n✅ <b>Всі системи працюють нормально!</b>"
+            else:
+                message += "\n⚠️ <b>Виявлено проблеми, перевірте логи.</b>"
+
+            await msg.edit_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error("Failed to check health", error=str(e), exc_info=True)
+            await msg.edit_text("❌ Помилка перевірки здоров'я системи")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
         if not self._is_admin(update.effective_user.id):
             return
 
+        self._admin_commands_count += 1
+
         help_message = (
-            "ℹ️ *Допомога по боту*\n\n"
-            "*Основні команди:*\n"
+            "ℹ️ <b>Довідка по командах</b>\n\n"
+            "<b>Основні команди:</b>\n"
             "/start - Початок роботи\n"
             "/status - Поточний статус системи\n"
             "/channels - Список активних каналів\n"
             "/stats - Детальна статистика\n"
-            "/costs - Витрати на накрутку\n"
-            "/help - Ця допомога\n\n"
-            "*Як працює бот:*\n"
+            "/costs - Витрати на накрутку\n\n"
+            "<b>Додаткові команди:</b>\n"
+            "/balance - Баланс Nakrutka\n"
+            "/orders - Активні замовлення\n"
+            "/errors - Останні помилки\n"
+            "/cache - Статистика кешу\n"
+            "/health - Перевірка здоров'я системи\n"
+            "/help - Ця довідка\n\n"
+            "<b>Як працює бот:</b>\n"
             "1. Моніторить канали кожні 30 секунд\n"
             "2. Знаходить нові пости\n"
             "3. Створює замовлення на накрутку\n"
             "4. Розподіляє по порціях (drip-feed)\n"
             "5. Відслідковує виконання\n\n"
-            "*Налаштування:*\n"
+            "<b>Налаштування:</b>\n"
             "• Перегляди - без рандомізації\n"
             "• Реакції - ±40% рандомізація\n"
             "• Репости - ±40% рандомізація\n\n"
-            "_Бот працює повністю автоматично_"
+            "<b>Розподіл навантаження:</b>\n"
+            "• 70% за перші 3-5 годин\n"
+            "• 30% протягом наступних 19 годин\n\n"
+            "<i>Бот працює повністю автоматично 24/7</i>"
         )
 
-        await update.message.reply_text(help_message, parse_mode='Markdown')
+        await update.message.reply_text(help_message, parse_mode=ParseMode.HTML)
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle non-command messages"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        # Could add functionality for adding channels by forwarding messages
+        # or other interactive features
+        await update.message.reply_text(
+            "💡 Використовуйте команди для управління ботом.\n"
+            "Наберіть /help для списку команд."
+        )
 
     def _is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
         return settings.admin_telegram_id and user_id == settings.admin_telegram_id
+
+    def get_monitor_stats(self) -> Dict[str, Any]:
+        """Get monitoring statistics"""
+        return {
+            'channels_monitored': len(self._channel_cache),
+            'total_cached_posts': sum(len(posts) for posts in self._channel_cache.values()),
+            'channels_with_errors': len(self._channel_errors),
+            'admin_commands_count': self._admin_commands_count,
+            'uptime_seconds': (datetime.utcnow() - self.start_time).total_seconds()
+        }
