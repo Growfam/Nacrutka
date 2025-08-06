@@ -276,6 +276,12 @@ class EnhancedTelegramMonitor:
         self.app.add_handler(CommandHandler("health", self.cmd_health))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
 
+        # Channel management commands
+        self.app.add_handler(CommandHandler("add_channel", self.cmd_add_channel))
+        self.app.add_handler(CommandHandler("remove_channel", self.cmd_remove_channel))
+        self.app.add_handler(CommandHandler("channel_info", self.cmd_channel_info))
+        self.app.add_handler(CommandHandler("stop_order", self.cmd_stop_order))
+
         # Telethon specific commands
         self.app.add_handler(CommandHandler("telethon_status", self.cmd_telethon_status))
         self.app.add_handler(CommandHandler("telethon_auth", self.cmd_telethon_auth))
@@ -798,7 +804,945 @@ class EnhancedTelegramMonitor:
         if len(self._channel_errors[channel_id]) > self._max_errors_per_channel:
             self._channel_errors[channel_id] = self._channel_errors[channel_id][-self._max_errors_per_channel:]
 
-    # ============ BOT COMMANDS (keeping all existing + new ones) ============
+    # ============ BOT COMMANDS ============
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        welcome_message = (
+            "🤖 <b>Telegram SMM Bot</b>\n\n"
+            "Автоматична система накрутки для Telegram каналів\n"
+            f"<i>Telethon: {'✅ Active' if self.telethon_initialized else '❌ Inactive'}</i>\n\n"
+            "<b>Основні команди:</b>\n"
+            "/status - Статус системи\n"
+            "/channels - Список каналів\n"
+            "/stats - Статистика по каналах\n"
+            "/costs - Витрати на накрутку\n"
+            "/balance - Баланс Nakrutka\n"
+            "/orders - Активні замовлення\n"
+            "/errors - Помилки системи\n"
+            "/health - Перевірка здоров'я\n"
+            "/telethon_status - Статус Telethon\n"
+            "/check_access <username> - Перевірити доступ\n"
+            "/help - Детальна допомога\n\n"
+            "<i>Бот працює 24/7 в автоматичному режимі</i>"
+        )
+
+        await update.message.reply_text(
+            welcome_message,
+            parse_mode=ParseMode.HTML
+        )
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /status command - показати статус системи"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        # Збираємо інформацію про статус
+        uptime = datetime.utcnow() - self.start_time
+        uptime_hours = uptime.total_seconds() / 3600
+
+        # Перевірка компонентів
+        db_status = "✅" if self.db else "❌"
+        nakrutka_status = "✅" if self.nakrutka_client else "❌"
+        telethon_status = "✅" if self.telethon_initialized else "❌"
+
+        # Активні замовлення
+        try:
+            active_orders = await self.db.fetchval(
+                "SELECT COUNT(*) FROM orders WHERE status = 'in_progress'"
+            )
+        except:
+            active_orders = "Error"
+
+        # Активні канали
+        try:
+            active_channels = await self.db.fetchval(
+                "SELECT COUNT(*) FROM channels WHERE is_active = true"
+            )
+        except:
+            active_channels = "Error"
+
+        # Статистика моніторингу
+        total_posts_today = self._stats['total_posts_found']
+
+        message = (
+            "🟢 <b>Статус системи</b>\n\n"
+            f"⏱ Uptime: {uptime_hours:.1f} годин\n"
+            f"💾 База даних: {db_status}\n"
+            f"💰 Nakrutka API: {nakrutka_status}\n"
+            f"🔌 Telethon: {telethon_status}\n\n"
+            f"📊 <b>Поточні показники:</b>\n"
+            f"Активних каналів: {active_channels}\n"
+            f"Активних замовлень: {active_orders}\n"
+            f"Знайдено постів за сесію: {total_posts_today}\n\n"
+            f"📈 <b>Методи доступу:</b>\n"
+            f"Telethon: {self._stats['telethon_success']} ✓ / {self._stats['telethon_fail']} ✗\n"
+            f"Bot API: {self._stats['bot_api_success']} ✓ / {self._stats['bot_api_fail']} ✗\n"
+            f"Web Parse: {self._stats['web_parse_success']} ✓ / {self._stats['web_parse_fail']} ✗"
+        )
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /stats command - статистика по каналах"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            # Отримуємо статистику по каналах
+            stats = await self.db.fetch("""
+                SELECT 
+                    c.channel_username,
+                    COUNT(DISTINCT p.id) as total_posts,
+                    COUNT(DISTINCT CASE WHEN p.status = 'completed' THEN p.id END) as completed_posts,
+                    COUNT(DISTINCT o.id) as total_orders,
+                    COALESCE(SUM(o.total_quantity), 0) as total_quantity_ordered
+                FROM channels c
+                LEFT JOIN posts p ON c.id = p.channel_id
+                LEFT JOIN orders o ON p.id = o.post_id
+                WHERE c.is_active = true
+                GROUP BY c.id, c.channel_username
+                ORDER BY total_posts DESC
+                LIMIT 10
+            """)
+
+            if not stats:
+                await update.message.reply_text("📊 Немає даних для відображення")
+                return
+
+            message = "📊 <b>Статистика по каналах</b>\n\n"
+
+            for stat in stats:
+                message += (
+                    f"📺 <b>@{stat['channel_username']}</b>\n"
+                    f"├ Постів: {stat['total_posts']} (оброблено: {stat['completed_posts']})\n"
+                    f"├ Замовлень: {stat['total_orders']}\n"
+                    f"└ Накручено: {format_number(stat['total_quantity_ordered'])}\n\n"
+                )
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error(f"Error in cmd_stats: {e}")
+            await update.message.reply_text("❌ Помилка отримання статистики")
+
+    async def cmd_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /channels command - список активних каналів"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            channels = await self.db.fetch("""
+                SELECT 
+                    c.*,
+                    cs.views_target,
+                    cs.reactions_target,
+                    cs.reposts_target,
+                    cs.randomize_percent
+                FROM channels c
+                LEFT JOIN channel_settings cs ON c.id = cs.channel_id
+                WHERE c.is_active = true
+                ORDER BY c.created_at DESC
+            """)
+
+            if not channels:
+                await update.message.reply_text(
+                    "📺 Немає активних каналів\n\n"
+                    "Додати канал: /add_channel @username"
+                )
+                return
+
+            message = "📺 <b>Активні канали</b>\n\n"
+
+            for ch in channels:
+                access_method = self._channel_access.get(ch['id'], 'unknown')
+                message += (
+                    f"@{ch['channel_username']} "
+                    f"({'✅' + access_method if access_method != 'unknown' else '❓'})\n"
+                    f"├ 👁 {ch['views_target'] or 0} "
+                    f"❤️ {ch['reactions_target'] or 0} "
+                    f"🔄 {ch['reposts_target'] or 0}\n"
+                    f"└ 🎲 ±{ch['randomize_percent'] or 0}%\n\n"
+                )
+
+            message += (
+                "\n<b>Команди:</b>\n"
+                "/add_channel @username - Додати канал\n"
+                "/remove_channel @username - Видалити канал\n"
+                "/channel_info @username - Детальна інформація"
+            )
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error(f"Error in cmd_channels: {e}")
+            await update.message.reply_text("❌ Помилка отримання списку каналів")
+
+    async def cmd_costs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /costs command - витрати на накрутку"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            # Витрати за сьогодні
+            today_costs = await self.db.fetchrow("""
+                SELECT 
+                    COUNT(DISTINCT o.id) as orders_count,
+                    SUM(o.total_quantity) as total_quantity,
+                    SUM(o.total_quantity * s.price_per_1000 / 1000) as total_cost
+                FROM orders o
+                JOIN services s ON o.service_id = s.nakrutka_id
+                WHERE DATE(o.created_at) = CURRENT_DATE
+            """)
+
+            # Витрати за тиждень
+            week_costs = await self.db.fetchrow("""
+                SELECT 
+                    COUNT(DISTINCT o.id) as orders_count,
+                    SUM(o.total_quantity) as total_quantity,
+                    SUM(o.total_quantity * s.price_per_1000 / 1000) as total_cost
+                FROM orders o
+                JOIN services s ON o.service_id = s.nakrutka_id
+                WHERE o.created_at >= CURRENT_DATE - INTERVAL '7 days'
+            """)
+
+            # Витрати за місяць
+            month_costs = await self.db.fetchrow("""
+                SELECT 
+                    COUNT(DISTINCT o.id) as orders_count,
+                    SUM(o.total_quantity) as total_quantity,
+                    SUM(o.total_quantity * s.price_per_1000 / 1000) as total_cost
+                FROM orders o
+                JOIN services s ON o.service_id = s.nakrutka_id
+                WHERE o.created_at >= CURRENT_DATE - INTERVAL '30 days'
+            """)
+
+            # Витрати по типах
+            type_costs = await self.db.fetch("""
+                SELECT 
+                    o.service_type,
+                    COUNT(DISTINCT o.id) as orders_count,
+                    SUM(o.total_quantity) as total_quantity,
+                    SUM(o.total_quantity * s.price_per_1000 / 1000) as total_cost
+                FROM orders o
+                JOIN services s ON o.service_id = s.nakrutka_id
+                WHERE o.created_at >= CURRENT_DATE - INTERVAL '7 days'
+                GROUP BY o.service_type
+                ORDER BY total_cost DESC
+            """)
+
+            message = "💰 <b>Витрати на накрутку</b>\n\n"
+
+            # Сьогодні
+            message += "📅 <b>Сьогодні:</b>\n"
+            message += f"├ Замовлень: {today_costs['orders_count'] or 0}\n"
+            message += f"├ Накручено: {format_number(today_costs['total_quantity'] or 0)}\n"
+            message += f"└ Витрачено: ${today_costs['total_cost'] or 0:.2f}\n\n"
+
+            # Тиждень
+            message += "📅 <b>За тиждень:</b>\n"
+            message += f"├ Замовлень: {week_costs['orders_count'] or 0}\n"
+            message += f"├ Накручено: {format_number(week_costs['total_quantity'] or 0)}\n"
+            message += f"└ Витрачено: ${week_costs['total_cost'] or 0:.2f}\n\n"
+
+            # Місяць
+            message += "📅 <b>За місяць:</b>\n"
+            message += f"├ Замовлень: {month_costs['orders_count'] or 0}\n"
+            message += f"├ Накручено: {format_number(month_costs['total_quantity'] or 0)}\n"
+            message += f"└ Витрачено: ${month_costs['total_cost'] or 0:.2f}\n\n"
+
+            # По типах
+            if type_costs:
+                message += "📊 <b>По типах (тиждень):</b>\n"
+                for tc in type_costs:
+                    emoji = {'views': '👁', 'reactions': '❤️', 'reposts': '🔄'}.get(tc['service_type'], '❓')
+                    message += f"{emoji} {tc['service_type']}: ${tc['total_cost'] or 0:.2f}\n"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error(f"Error in cmd_costs: {e}")
+            await update.message.reply_text("❌ Помилка отримання витрат")
+
+    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /balance command - баланс Nakrutka"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        if not self.nakrutka_client:
+            await update.message.reply_text("❌ Nakrutka client не ініціалізовано")
+            return
+
+        try:
+            balance_info = await self.nakrutka_client.get_balance()
+            balance = float(balance_info.get('balance', 0))
+            currency = balance_info.get('currency', 'USD')
+
+            # Визначаємо статус балансу
+            if balance < 1:
+                status = "🔴 Критично низький!"
+                emoji = "❌"
+            elif balance < 10:
+                status = "🟡 Низький"
+                emoji = "⚠️"
+            elif balance < 50:
+                status = "🟢 Нормальний"
+                emoji = "✅"
+            else:
+                status = "🟢 Відмінний"
+                emoji = "💎"
+
+            # Розраховуємо на скільки вистачить
+            avg_daily_cost = await self.db.fetchval("""
+                SELECT AVG(daily_cost) as avg_cost
+                FROM (
+                    SELECT 
+                        DATE(o.created_at) as date,
+                        SUM(o.total_quantity * s.price_per_1000 / 1000) as daily_cost
+                    FROM orders o
+                    JOIN services s ON o.service_id = s.nakrutka_id
+                    WHERE o.created_at >= CURRENT_DATE - INTERVAL '7 days'
+                    GROUP BY DATE(o.created_at)
+                ) daily_costs
+            """)
+
+            days_left = int(balance / avg_daily_cost) if avg_daily_cost and avg_daily_cost > 0 else 999
+
+            message = (
+                f"💰 <b>Баланс Nakrutka</b>\n\n"
+                f"{emoji} Баланс: ${balance:.2f} {currency}\n"
+                f"📊 Статус: {status}\n"
+            )
+
+            if avg_daily_cost and avg_daily_cost > 0:
+                message += (
+                    f"\n📈 <b>Аналітика:</b>\n"
+                    f"├ Середні витрати: ${avg_daily_cost:.2f}/день\n"
+                    f"└ Вистачить на: ~{days_left} днів\n"
+                )
+
+            if balance < 10:
+                message += "\n⚠️ <b>Рекомендується поповнити баланс!</b>"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error(f"Error in cmd_balance: {e}")
+            await update.message.reply_text("❌ Помилка отримання балансу")
+
+    async def cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /orders command - активні замовлення"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            orders = await self.db.fetch("""
+                SELECT 
+                    o.*,
+                    p.post_url,
+                    c.channel_username,
+                    s.service_name,
+                    s.price_per_1000
+                FROM orders o
+                JOIN posts p ON o.post_id = p.id
+                JOIN channels c ON p.channel_id = c.id
+                LEFT JOIN services s ON o.service_id = s.nakrutka_id
+                WHERE o.status IN ('pending', 'in_progress')
+                ORDER BY o.created_at DESC
+                LIMIT 15
+            """)
+
+            if not orders:
+                await update.message.reply_text("📭 Немає активних замовлень")
+                return
+
+            message = "📋 <b>Активні замовлення</b>\n\n"
+
+            # Групуємо по статусу
+            pending = [o for o in orders if o['status'] == 'pending']
+            in_progress = [o for o in orders if o['status'] == 'in_progress']
+
+            if in_progress:
+                message += "🔄 <b>В процесі:</b>\n"
+                for order in in_progress[:7]:
+                    emoji = {'views': '👁', 'reactions': '❤️', 'reposts': '🔄'}.get(order['service_type'], '❓')
+                    cost = (order['total_quantity'] * order['price_per_1000'] / 1000) if order['price_per_1000'] else 0
+                    message += (
+                        f"{emoji} @{order['channel_username']}/{order['post_url'].split('/')[-1]}\n"
+                        f"├ К-сть: {format_number(order['total_quantity'])}\n"
+                        f"├ Ціна: ${cost:.3f}\n"
+                        f"└ ID: {order['nakrutka_order_id']}\n\n"
+                    )
+
+            if pending:
+                message += "⏳ <b>В черзі:</b>\n"
+                for order in pending[:5]:
+                    emoji = {'views': '👁', 'reactions': '❤️', 'reposts': '🔄'}.get(order['service_type'], '❓')
+                    message += f"{emoji} {order['channel_username']}: {format_number(order['total_quantity'])}\n"
+
+            message += f"\n📊 Всього активних: {len(orders)}"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error(f"Error in cmd_orders: {e}")
+            await update.message.reply_text("❌ Помилка отримання замовлень")
+
+    async def cmd_errors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /errors command - останні помилки"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        try:
+            # Помилки з БД
+            db_errors = await self.db.fetch("""
+                SELECT * FROM logs 
+                WHERE level = 'error' 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            """)
+
+            message = "❌ <b>Останні помилки</b>\n\n"
+
+            # Помилки каналів в пам'яті
+            if self._channel_errors:
+                message += "📺 <b>Помилки каналів:</b>\n"
+                for channel_id, errors in list(self._channel_errors.items())[:5]:
+                    channel = await self.db.fetchrow(
+                        "SELECT channel_username FROM channels WHERE id = $1",
+                        channel_id
+                    )
+                    if channel:
+                        last_error = errors[-1]
+                        message += (
+                            f"@{channel['channel_username']}:\n"
+                            f"├ {last_error['type']}\n"
+                            f"├ {truncate_text(last_error['error'], 50)}\n"
+                            f"└ {last_error['timestamp'].strftime('%H:%M')}\n\n"
+                        )
+
+            # Помилки з БД
+            if db_errors:
+                message += "\n💾 <b>Системні помилки:</b>\n"
+                for error in db_errors[:5]:
+                    context_data = error.get('context', {})
+                    message += (
+                        f"🕐 {error['created_at'].strftime('%d.%m %H:%M')}\n"
+                        f"├ {truncate_text(error['message'], 100)}\n"
+                    )
+                    if context_data.get('error_type'):
+                        message += f"└ Type: {context_data['error_type']}\n"
+                    message += "\n"
+
+            if not self._channel_errors and not db_errors:
+                message = "✅ Немає помилок!"
+
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+        except Exception as e:
+            logger.error(f"Error in cmd_errors: {e}")
+            await update.message.reply_text("❌ Помилка отримання логів помилок")
+
+    async def cmd_cache(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cache command - інформація про кеш"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        # Статистика кешу
+        total_cached_channels = len(self._channel_cache)
+        total_cached_posts = sum(
+            len(data.get('posts', []))
+            for data in self._channel_cache.values()
+        )
+
+        # Розміри кешу по типах
+        cache_sizes = {
+            'posts': len(self._cache_timestamps['posts']),
+            'channel_info': len(self._cache_timestamps['channel_info']),
+            'access': len(self._cache_timestamps['access'])
+        }
+
+        message = (
+            "💾 <b>Статистика кешу</b>\n\n"
+            f"📊 Закешовано каналів: {total_cached_channels}\n"
+            f"📝 Закешовано постів: {format_number(total_cached_posts)}\n\n"
+            f"<b>По типах:</b>\n"
+        )
+
+        for cache_type, size in cache_sizes.items():
+            ttl = self._cache_ttl[cache_type]
+            message += f"├ {cache_type}: {size} записів (TTL: {ttl}s)\n"
+
+        # Топ каналів по кількості постів в кеші
+        if self._channel_cache:
+            message += "\n<b>Топ каналів в кеші:</b>\n"
+            sorted_channels = sorted(
+                self._channel_cache.items(),
+                key=lambda x: len(x[1].get('posts', [])),
+                reverse=True
+            )[:5]
+
+            for channel_id, data in sorted_channels:
+                posts_count = len(data.get('posts', []))
+                channel = await self.db.fetchrow(
+                    "SELECT channel_username FROM channels WHERE id = $1",
+                    channel_id
+                )
+                if channel:
+                    message += f"├ @{channel['channel_username']}: {posts_count} постів\n"
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    async def cmd_health(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /health command - перевірка здоров'я системи"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        msg = await update.message.reply_text("🏥 Перевіряю здоров'я системи...")
+
+        health_checks = {
+            'database': False,
+            'nakrutka': False,
+            'telethon': False,
+            'bot_api': False
+        }
+
+        # Перевірка БД
+        try:
+            await self.db.fetchval("SELECT 1")
+            health_checks['database'] = True
+        except:
+            pass
+
+        # Перевірка Nakrutka
+        if self.nakrutka_client:
+            try:
+                health = await self.nakrutka_client.health_check()
+                health_checks['nakrutka'] = health['status'] == 'healthy'
+            except:
+                pass
+
+        # Перевірка Telethon
+        health_checks['telethon'] = self.telethon_initialized
+
+        # Перевірка Bot API
+        try:
+            bot_info = await self.bot.get_me()
+            health_checks['bot_api'] = True
+        except:
+            pass
+
+        # Формуємо повідомлення
+        all_ok = all(health_checks.values())
+        status_emoji = "✅" if all_ok else "⚠️"
+
+        message = f"{status_emoji} <b>Здоров'я системи</b>\n\n"
+
+        for component, status in health_checks.items():
+            emoji = "✅" if status else "❌"
+            message += f"{emoji} {component.title()}\n"
+
+        # Додаткова статистика
+        uptime = datetime.utcnow() - self.start_time
+        message += (
+            f"\n📊 <b>Статистика:</b>\n"
+            f"├ Uptime: {format_duration(int(uptime.total_seconds()))}\n"
+            f"├ Команд від адміна: {self._admin_commands_count}\n"
+            f"├ Помилок каналів: {sum(len(e) for e in self._channel_errors.values())}\n"
+            f"└ Flood limits: {len(self._flood_wait_until)}\n"
+        )
+
+        if not all_ok:
+            message += "\n⚠️ <b>Деякі компоненти не працюють!</b>"
+
+        await msg.edit_text(message, parse_mode=ParseMode.HTML)
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command - детальна допомога"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        self._admin_commands_count += 1
+
+        help_message = (
+            "📚 <b>Детальна допомога по командах</b>\n\n"
+            "<b>🔍 Моніторинг:</b>\n"
+            "/status - Загальний статус системи\n"
+            "/channels - Список активних каналів\n"
+            "/stats - Статистика по каналах\n"
+            "/check_access @username - Перевірити доступ до каналу\n\n"
+            
+            "<b>💰 Фінанси:</b>\n"
+            "/balance - Баланс Nakrutka\n"
+            "/costs - Витрати на накрутку\n"
+            "/orders - Активні замовлення\n\n"
+            
+            "<b>⚙️ Система:</b>\n"
+            "/health - Перевірка компонентів\n"
+            "/errors - Останні помилки\n"
+            "/cache - Статистика кешу\n"
+            "/telethon_status - Статус Telethon\n\n"
+            
+            "<b>📺 Управління каналами:</b>\n"
+            "/add_channel @username - Додати канал\n"
+            "/remove_channel @username - Видалити канал\n"
+            "/channel_info @username - Інформація про канал\n"
+            "/stop_order <ID> - Зупинити замовлення\n\n"
+            
+            "<b>💡 Поради:</b>\n"
+            "• Бот автоматично перевіряє канали кожні 30 секунд\n"
+            "• Використовуйте Telethon для приватних каналів\n"
+            "• Слідкуйте за балансом Nakrutka\n"
+            "• Перевіряйте /errors при проблемах\n"
+        )
+
+        await update.message.reply_text(help_message, parse_mode=ParseMode.HTML)
+
+    async def cmd_add_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /add_channel command - додати новий канал"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Вкажіть username каналу\n"
+                "Приклад: /add_channel @durov"
+            )
+            return
+
+        username = context.args[0].lstrip('@').lower()
+
+        # Перевіряємо чи вже є такий канал
+        existing = await self.db.fetchrow(
+            "SELECT * FROM channels WHERE channel_username = $1",
+            username
+        )
+
+        if existing:
+            if existing['is_active']:
+                await update.message.reply_text(f"❌ Канал @{username} вже активний")
+            else:
+                # Активуємо існуючий канал
+                await self.db.execute(
+                    "UPDATE channels SET is_active = true WHERE id = $1",
+                    existing['id']
+                )
+                await update.message.reply_text(f"✅ Канал @{username} активовано")
+            return
+
+        # Перевіряємо доступ до каналу
+        msg = await update.message.reply_text(f"🔍 Перевіряю канал @{username}...")
+
+        try:
+            # Спробуємо отримати інформацію про канал
+            channel_id = None
+            channel_title = None
+
+            # Спроба через Telethon
+            if self.telethon_initialized:
+                try:
+                    entity = await self.telethon_client.get_entity(username)
+                    if hasattr(entity, 'id'):
+                        channel_id = entity.id
+                        channel_title = getattr(entity, 'title', username)
+                except:
+                    pass
+
+            # Спроба через Bot API
+            if not channel_id:
+                try:
+                    chat = await self.bot.get_chat(f"@{username}")
+                    channel_id = chat.id
+                    channel_title = chat.title
+                except:
+                    pass
+
+            # Створюємо канал
+            new_channel_id = await self.db.fetchval("""
+                INSERT INTO channels (channel_username, channel_id, is_active)
+                VALUES ($1, $2, true)
+                RETURNING id
+            """, username, channel_id)
+
+            # Створюємо налаштування за замовчуванням
+            await self.db.execute("""
+                INSERT INTO channel_settings (
+                    channel_id, 
+                    views_target, 
+                    reactions_target, 
+                    reposts_target,
+                    randomize_percent
+                )
+                VALUES ($1, 1000, 50, 20, 30)
+            """, new_channel_id)
+
+            success_msg = f"✅ Канал @{username} додано!\n"
+            if channel_title:
+                success_msg += f"Назва: {channel_title}\n"
+            if channel_id:
+                success_msg += f"ID: {channel_id}\n"
+            success_msg += "\nНалаштування за замовчуванням:\n"
+            success_msg += "👁 1000 | ❤️ 50 | 🔄 20 | 🎲 ±30%"
+
+            await msg.edit_text(success_msg)
+
+            # Логуємо
+            await self.db_logger.info(
+                "Channel added",
+                channel=username,
+                channel_id=channel_id,
+                added_by=update.effective_user.id
+            )
+
+        except Exception as e:
+            logger.error(f"Error adding channel: {e}")
+            await msg.edit_text(f"❌ Помилка додавання каналу: {str(e)[:100]}")
+
+    async def cmd_remove_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /remove_channel command - видалити канал"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Вкажіть username каналу\n"
+                "Приклад: /remove_channel @durov"
+            )
+            return
+
+        username = context.args[0].lstrip('@').lower()
+
+        # Знаходимо канал
+        channel = await self.db.fetchrow(
+            "SELECT * FROM channels WHERE channel_username = $1",
+            username
+        )
+
+        if not channel:
+            await update.message.reply_text(f"❌ Канал @{username} не знайдено")
+            return
+
+        # Деактивуємо канал (не видаляємо для збереження історії)
+        await self.db.execute(
+            "UPDATE channels SET is_active = false WHERE id = $1",
+            channel['id']
+        )
+
+        # Скасовуємо активні замовлення
+        cancelled = await self.db.fetchval("""
+            UPDATE orders 
+            SET status = 'cancelled'
+            WHERE post_id IN (
+                SELECT id FROM posts WHERE channel_id = $1
+            ) AND status IN ('pending', 'in_progress')
+            RETURNING COUNT(*)
+        """, channel['id'])
+
+        message = f"✅ Канал @{username} деактивовано"
+        if cancelled:
+            message += f"\n📛 Скасовано замовлень: {cancelled}"
+
+        await update.message.reply_text(message)
+
+        # Логуємо
+        await self.db_logger.info(
+            "Channel removed",
+            channel=username,
+            removed_by=update.effective_user.id,
+            cancelled_orders=cancelled
+        )
+
+    async def cmd_channel_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /channel_info command - детальна інформація про канал"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Вкажіть username каналу\n"
+                "Приклад: /channel_info @durov"
+            )
+            return
+
+        username = context.args[0].lstrip('@').lower()
+
+        # Отримуємо інформацію з БД
+        channel_data = await self.db.fetchrow("""
+            SELECT 
+                c.*,
+                cs.*,
+                COUNT(DISTINCT p.id) as total_posts,
+                COUNT(DISTINCT CASE WHEN p.status = 'completed' THEN p.id END) as completed_posts,
+                COUNT(DISTINCT o.id) as total_orders,
+                COALESCE(SUM(o.total_quantity * s.price_per_1000 / 1000), 0) as total_spent
+            FROM channels c
+            LEFT JOIN channel_settings cs ON c.id = cs.channel_id
+            LEFT JOIN posts p ON c.id = p.channel_id
+            LEFT JOIN orders o ON p.id = o.post_id
+            LEFT JOIN services s ON o.service_id = s.nakrutka_id
+            WHERE c.channel_username = $1
+            GROUP BY c.id, cs.id
+        """, username)
+
+        if not channel_data:
+            await update.message.reply_text(f"❌ Канал @{username} не знайдено")
+            return
+
+        # Формуємо повідомлення
+        status = "✅ Активний" if channel_data['is_active'] else "❌ Неактивний"
+        access = self._channel_access.get(channel_data['id'], 'unknown')
+
+        message = (
+            f"📺 <b>Канал @{username}</b>\n\n"
+            f"Статус: {status}\n"
+            f"Доступ: {access}\n"
+            f"ID: {channel_data['channel_id'] or 'невідомо'}\n"
+            f"Додано: {channel_data['created_at'].strftime('%d.%m.%Y')}\n\n"
+            
+            f"<b>Налаштування накрутки:</b>\n"
+            f"👁 Перегляди: {channel_data['views_target'] or 0}\n"
+            f"❤️ Реакції: {channel_data['reactions_target'] or 0}\n"
+            f"🔄 Репости: {channel_data['reposts_target'] or 0}\n"
+            f"🎲 Рандомізація: ±{channel_data['randomize_percent'] or 0}%\n\n"
+            
+            f"<b>Статистика:</b>\n"
+            f"Постів: {channel_data['total_posts']} (оброблено: {channel_data['completed_posts']})\n"
+            f"Замовлень: {channel_data['total_orders']}\n"
+            f"Витрачено: ${channel_data['total_spent']:.2f}\n"
+        )
+
+        # Останні пости
+        recent_posts = await self.db.fetch("""
+            SELECT * FROM posts 
+            WHERE channel_id = $1 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        """, channel_data['id'])
+
+        if recent_posts:
+            message += "\n<b>Останні пости:</b>\n"
+            for post in recent_posts:
+                status_emoji = {
+                    'new': '🆕',
+                    'processing': '⏳',
+                    'completed': '✅',
+                    'failed': '❌'
+                }.get(post['status'], '❓')
+                message += f"{status_emoji} /{post['post_id']} - {post['created_at'].strftime('%H:%M')}\n"
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    async def cmd_stop_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /stop_order command - зупинити замовлення"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Вкажіть ID замовлення\n"
+                "Приклад: /stop_order 12345"
+            )
+            return
+
+        try:
+            order_id = context.args[0]
+
+            # Перевіряємо чи це Nakrutka ID чи наш ID
+            if order_id.isdigit():
+                # Наш ID
+                order = await self.db.fetchrow(
+                    "SELECT * FROM orders WHERE id = $1",
+                    int(order_id)
+                )
+            else:
+                # Nakrutka ID
+                order = await self.db.fetchrow(
+                    "SELECT * FROM orders WHERE nakrutka_order_id = $1",
+                    order_id
+                )
+
+            if not order:
+                await update.message.reply_text(f"❌ Замовлення {order_id} не знайдено")
+                return
+
+            if order['status'] not in ['pending', 'in_progress']:
+                await update.message.reply_text(
+                    f"❌ Замовлення вже {order['status']}"
+                )
+                return
+
+            # Скасовуємо через Nakrutka API
+            if self.nakrutka_client and order['nakrutka_order_id']:
+                try:
+                    result = await self.nakrutka_client.cancel_order(
+                        order['nakrutka_order_id']
+                    )
+                    if result:
+                        await update.message.reply_text(
+                            f"✅ Замовлення {order['nakrutka_order_id']} скасовано в Nakrutka"
+                        )
+                except Exception as e:
+                    logger.error(f"Error cancelling order in Nakrutka: {e}")
+
+            # Оновлюємо статус в БД
+            await self.db.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE id = $1",
+                order['id']
+            )
+
+            await update.message.reply_text(
+                f"⏹ Замовлення {order['id']} ({order['service_type']}) скасовано"
+            )
+
+            # Логуємо
+            await self.db_logger.info(
+                "Order cancelled",
+                order_id=order['id'],
+                nakrutka_id=order['nakrutka_order_id'],
+                cancelled_by=update.effective_user.id
+            )
+
+        except Exception as e:
+            logger.error(f"Error in cmd_stop_order: {e}")
+            await update.message.reply_text(f"❌ Помилка: {str(e)[:100]}")
 
     async def cmd_telethon_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /telethon_status command"""
@@ -939,40 +1883,25 @@ class EnhancedTelegramMonitor:
         message = f"📊 <b>Access Check: @{username}</b>\n\n" + "\n".join(results)
         await msg.edit_text(message, parse_mode=ParseMode.HTML)
 
-    # Keep all existing command handlers...
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle non-command messages"""
         if not self._is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Unauthorized")
             return
 
-        self._admin_commands_count += 1
+        # Можна додати обробку звичайних повідомлень
+        # Наприклад, автоматичне розпізнавання username каналів
+        text = update.message.text
 
-        welcome_message = (
-            "🤖 <b>Telegram SMM Bot</b>\n\n"
-            "Автоматична система накрутки для Telegram каналів\n"
-            f"<i>Telethon: {'✅ Active' if self.telethon_initialized else '❌ Inactive'}</i>\n\n"
-            "<b>Основні команди:</b>\n"
-            "/status - Статус системи\n"
-            "/channels - Список каналів\n"
-            "/stats - Статистика по каналах\n"
-            "/costs - Витрати на накрутку\n"
-            "/balance - Баланс Nakrutka\n"
-            "/orders - Активні замовлення\n"
-            "/errors - Помилки системи\n"
-            "/health - Перевірка здоров'я\n"
-            "/telethon_status - Статус Telethon\n"
-            "/check_access <username> - Перевірити доступ\n"
-            "/help - Детальна допомога\n\n"
-            "<i>Бот працює 24/7 в автоматичному режимі</i>"
-        )
-
-        await update.message.reply_text(
-            welcome_message,
-            parse_mode=ParseMode.HTML
-        )
-
-    # ... (keep all other existing commands as they are)
+        # Шукаємо username в тексті
+        username_match = re.search(r'@(\w+)', text)
+        if username_match:
+            username = username_match.group(1)
+            # Можна автоматично запропонувати додати канал
+            await update.message.reply_text(
+                f"Знайдено канал @{username}\n"
+                f"Додати його? Використайте:\n"
+                f"/add_channel @{username}"
+            )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle errors in telegram bot"""
