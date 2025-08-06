@@ -1,6 +1,6 @@
 """
 Post processing service - Universal implementation for all channels
-FIXED VERSION: Properly saves nakrutka_order_id and handles drip-feed correctly
+FIXED VERSION: Each portion creates SEPARATE order in Nakrutka
 """
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
@@ -84,6 +84,8 @@ class PostProcessor:
         """Process all posts with 'new' status"""
         async with self._processing_lock:
             try:
+                logger.info("=== Starting process_new_posts ===")
+
                 # Ensure service cache is populated
                 if not self.queries._service_cache.services:
                     logger.info("Service cache empty, refreshing...")
@@ -167,7 +169,7 @@ class PostProcessor:
     ):
         """Process single post with pre-loaded configuration"""
         logger.info(
-            f"Processing post {post.post_id}",
+            f"=== Processing post {post.post_id} ===",
             post_id=post.id,
             channel_id=post.channel_id,
             url=post.post_url
@@ -216,7 +218,7 @@ class PostProcessor:
             post.id
         )
 
-        # Process each service type - NOW WITHOUT TRANSACTION
+        # Process each service type
         results = await self._process_all_service_types(
             post=post,
             config=config,
@@ -249,6 +251,8 @@ class PostProcessor:
         else:
             reposts = settings.reposts_target
 
+        logger.info(f"Calculated quantities: views={views}, reactions={reactions}, reposts={reposts}")
+
         return {
             'views': views,
             'reactions': reactions,
@@ -274,6 +278,7 @@ class PostProcessor:
 
         # Process views
         if quantities['views'] > 0 and templates.get('views'):
+            logger.info(f"Processing views: {quantities['views']}")
             results['views'] = await self._create_service_order(
                 post=post,
                 service_type='views',
@@ -285,6 +290,7 @@ class PostProcessor:
 
         # Process reactions - special handling for multiple services
         if quantities['reactions'] > 0:
+            logger.info(f"Processing reactions: {quantities['reactions']}")
             if reaction_services and len(reaction_services) > 1:
                 # Multiple reaction types - distribute
                 results['reactions'] = await self._create_distributed_reactions(
@@ -304,15 +310,17 @@ class PostProcessor:
                     delay_minutes=0
                 )
 
-        # Process reposts
+        # Process reposts - ONLY ONE PORTION!
         if quantities['reposts'] > 0 and templates.get('reposts'):
+            logger.info(f"Processing reposts: {quantities['reposts']} (single portion only)")
             results['reposts'] = await self._create_service_order(
                 post=post,
                 service_type='reposts',
                 quantity=quantities['reposts'],
-                templates=templates['reposts'],
+                templates=None,  # Force single portion for reposts
                 service_id=settings.reposts_service_id,
-                delay_minutes=5  # Default delay for reposts
+                delay_minutes=5,
+                force_single_portion=True  # New parameter
             )
 
         return results
@@ -324,13 +332,21 @@ class PostProcessor:
         quantity: int,
         templates: List[PortionTemplate],
         service_id: Optional[int] = None,
-        delay_minutes: int = 0
+        delay_minutes: int = 0,
+        force_single_portion: bool = False
     ) -> Dict[str, Any]:
         """Create order for a service type"""
         if quantity <= 0:
             return {'success': True, 'skipped': True, 'reason': 'Zero quantity'}
 
         try:
+            logger.info(
+                f"=== Creating {service_type} order ===",
+                quantity=quantity,
+                service_id=service_id,
+                force_single_portion=force_single_portion
+            )
+
             # Get or find service
             if not service_id:
                 service = await self._find_best_service(service_type, quantity)
@@ -365,37 +381,50 @@ class PostProcessor:
                 start_delay_minutes=delay_minutes
             )
 
+            logger.info(f"Created order record: {order_id}")
+
             # Calculate portions
-            portions = await self._calculate_optimized_portions(
-                quantity=adjusted_quantity,
-                service=service,
-                templates=templates,
-                delay_minutes=delay_minutes
-            )
+            if force_single_portion or service_type == 'reposts':
+                # Force single portion for reposts
+                portions = [{
+                    'portion_number': 1,
+                    'quantity_per_run': adjusted_quantity,
+                    'runs': 1,
+                    'interval_minutes': 0,
+                    'scheduled_at': datetime.utcnow() + timedelta(minutes=delay_minutes),
+                    'total_quantity': adjusted_quantity
+                }]
+                logger.info(f"Using single portion for {service_type}")
+            else:
+                portions = await self._calculate_optimized_portions(
+                    quantity=adjusted_quantity,
+                    service=service,
+                    templates=templates,
+                    delay_minutes=delay_minutes
+                )
+                logger.info(f"Calculated {len(portions)} portions for {service_type}")
 
-            # Save portions to database
-            await self._save_portions(order_id, portions)
-
-            # Send to Nakrutka - NOW PROPERLY
-            nakrutka_results = await self._send_to_nakrutka_drip_feed(
+            # Send to Nakrutka - EACH PORTION SEPARATELY!
+            nakrutka_results = await self._send_portions_to_nakrutka(
                 order_id=order_id,
                 service=service,
                 link=post.post_url,
-                portions=portions
+                portions=portions,
+                service_type=service_type
             )
 
             # Calculate cost
             cost = float(service.calculate_cost(adjusted_quantity))
 
             logger.info(
-                f"{service_type.capitalize()} order created",
+                f"{service_type.capitalize()} order completed",
                 order_id=order_id,
                 service_id=service.nakrutka_id,
                 service_name=service.service_name,
                 quantity=adjusted_quantity,
                 portions=len(portions),
                 cost=f"${cost:.2f}",
-                nakrutka_success=nakrutka_results.get('success', False)
+                successful_portions=nakrutka_results['successful_portions']
             )
 
             return {
@@ -421,168 +450,149 @@ class PostProcessor:
                 'error_type': type(e).__name__
             }
 
-    async def _send_to_nakrutka_drip_feed(
+    async def _send_portions_to_nakrutka(
         self,
         order_id: int,
         service: Service,
         link: str,
-        portions: List[Dict[str, Any]]
+        portions: List[Dict[str, Any]],
+        service_type: str
     ) -> Dict[str, Any]:
-        """Send to Nakrutka with PROPER drip-feed handling"""
+        """Send each portion as SEPARATE order to Nakrutka"""
 
-        # Check if this is drip-feed (multiple portions)
-        is_drip_feed = len(portions) > 1
+        logger.info(
+            f"=== Sending {len(portions)} portions to Nakrutka ===",
+            order_id=order_id,
+            service_type=service_type
+        )
 
-        if is_drip_feed:
-            # DRIP-FEED: Create ONE order with total runs
+        results = {
+            'successful_portions': 0,
+            'failed_portions': 0,
+            'portion_results': []
+        }
 
-            # Calculate total quantity and runs
-            total_quantity = sum(p['quantity_per_run'] * p['runs'] for p in portions)
-            total_runs = sum(p['runs'] for p in portions)
-
-            # Calculate quantity per run (should be consistent)
-            quantity_per_run = total_quantity // total_runs if total_runs > 0 else total_quantity
-
-            # Use average interval (or take from first portion)
-            interval = portions[0]['interval_minutes'] if portions else 15
-
-            logger.info(
-                f"Creating SINGLE drip-feed order",
-                order_id=order_id,
-                total_quantity=total_quantity,
-                quantity_per_run=quantity_per_run,
-                total_runs=total_runs,
-                interval=interval,
-                portions_count=len(portions)
-            )
-
+        # Create SEPARATE order for EACH portion
+        for portion in portions:
             try:
-                # Create ONE drip-feed order
-                result = await self.nakrutka.create_order(
-                    service_id=service.nakrutka_id,
-                    link=link,
-                    quantity=quantity_per_run,
-                    runs=total_runs,
-                    interval=interval
+                portion_total = portion['quantity_per_run'] * portion['runs']
+
+                logger.info(
+                    f"Creating Nakrutka order for portion {portion['portion_number']}",
+                    order_id=order_id,
+                    portion_number=portion['portion_number'],
+                    total_for_portion=portion_total,
+                    quantity_per_run=portion['quantity_per_run'],
+                    runs=portion['runs'],
+                    interval=portion['interval_minutes']
                 )
 
-                logger.info(f"Nakrutka API response: {result}")
-
-                nakrutka_order_id = str(result.get('order'))
-                if not nakrutka_order_id or nakrutka_order_id == 'None':
-                    raise Exception(f"No order ID in response: {result}")
-
-                # Update order with nakrutka_id - WITH VERIFICATION
-                success = await self.queries.update_order_nakrutka_id(order_id, nakrutka_order_id)
-
-                if not success:
-                    raise Exception(f"Failed to update order {order_id} with nakrutka_id {nakrutka_order_id}")
-
-                # Verify update
-                verified_id = await self.queries.verify_order_update(order_id)
-                if verified_id != nakrutka_order_id:
-                    raise Exception(f"Verification failed: expected {nakrutka_order_id}, got {verified_id}")
-
-                logger.info(f"Successfully verified order {order_id} with nakrutka_id {nakrutka_order_id}")
-
-                # Update ALL portions with the SAME nakrutka_order_id
-                await self.queries.update_all_portions_for_order(
-                    order_id,
-                    PORTION_STATUS["RUNNING"],
-                    nakrutka_order_id
-                )
-
-                return {
-                    'success': True,
-                    'nakrutka_order_id': nakrutka_order_id,
-                    'order_type': 'drip_feed',
-                    'total_quantity': total_quantity,
-                    'runs': total_runs,
-                    'interval': interval
-                }
-
-            except Exception as e:
-                logger.error(f"Failed to create drip-feed order: {e}")
-
-                # Update status to failed
-                await self.db.execute(
-                    "UPDATE orders SET status = $1 WHERE id = $2",
-                    ORDER_STATUS["FAILED"],
-                    order_id
-                )
-
-                raise
-
-        else:
-            # SINGLE ORDER: One portion or simple order
-            portion = portions[0] if portions else {'quantity_per_run': 0, 'runs': 1, 'interval_minutes': 0}
-
-            try:
-                # Check if this single portion has multiple runs
-                if portion.get('runs', 1) > 1:
-                    # Still use drip-feed for multiple runs
-                    result = await self.nakrutka.create_order(
+                # Create order in Nakrutka
+                if portion['runs'] > 1:
+                    # Drip-feed order for this portion
+                    nakrutka_result = await self.nakrutka.create_order(
                         service_id=service.nakrutka_id,
                         link=link,
                         quantity=portion['quantity_per_run'],
                         runs=portion['runs'],
-                        interval=portion.get('interval_minutes', 15)
+                        interval=portion['interval_minutes']
                     )
                 else:
-                    # Simple order without drip-feed
-                    total_qty = portion.get('total_quantity', portion['quantity_per_run'])
-                    result = await self.nakrutka.create_order(
+                    # Simple order (single run)
+                    nakrutka_result = await self.nakrutka.create_order(
                         service_id=service.nakrutka_id,
                         link=link,
-                        quantity=total_qty
+                        quantity=portion_total
                     )
 
-                logger.info(f"Nakrutka API response: {result}")
-
-                nakrutka_order_id = str(result.get('order'))
-                if not nakrutka_order_id or nakrutka_order_id == 'None':
-                    raise Exception(f"No order ID in response: {result}")
-
-                # Update order with verification
-                success = await self.queries.update_order_nakrutka_id(order_id, nakrutka_order_id)
-
-                if not success:
-                    raise Exception(f"Failed to update order {order_id}")
-
-                # Update portion if exists
-                if portions:
-                    await self.db.execute(
-                        """
-                        UPDATE order_portions
-                        SET nakrutka_portion_id = $1,
-                            status = $2,
-                            started_at = $3
-                        WHERE order_id = $4 AND portion_number = $5
-                        """,
-                        nakrutka_order_id,
-                        PORTION_STATUS["RUNNING"],
-                        datetime.utcnow(),
-                        order_id,
-                        portion['portion_number']
-                    )
-
-                return {
-                    'success': True,
-                    'nakrutka_order_id': nakrutka_order_id,
-                    'order_type': 'single',
-                    'quantity': portion.get('total_quantity', portion['quantity_per_run'])
-                }
-
-            except Exception as e:
-                logger.error(f"Failed to create single order: {e}")
-
-                await self.db.execute(
-                    "UPDATE orders SET status = $1 WHERE id = $2",
-                    ORDER_STATUS["FAILED"],
-                    order_id
+                logger.info(
+                    f"Nakrutka API response for portion {portion['portion_number']}",
+                    response=nakrutka_result
                 )
 
-                raise
+                nakrutka_order_id = str(nakrutka_result.get('order'))
+
+                if not nakrutka_order_id or nakrutka_order_id == 'None':
+                    raise Exception(f"No order ID in response: {nakrutka_result}")
+
+                # Save portion to DB WITH its own nakrutka_order_id
+                portion_db_id = await self.db.fetchval(
+                    """
+                    INSERT INTO order_portions 
+                    (order_id, portion_number, quantity_per_run, runs, 
+                     interval_minutes, nakrutka_portion_id, status, 
+                     scheduled_at, started_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    RETURNING id
+                    """,
+                    order_id,
+                    portion['portion_number'],
+                    portion['quantity_per_run'],
+                    portion['runs'],
+                    portion['interval_minutes'],
+                    nakrutka_order_id,  # Unique for each portion!
+                    PORTION_STATUS["RUNNING"],
+                    portion.get('scheduled_at'),
+                    datetime.utcnow()
+                )
+
+                logger.info(
+                    f"✓ Portion {portion['portion_number']} saved",
+                    portion_db_id=portion_db_id,
+                    nakrutka_order_id=nakrutka_order_id
+                )
+
+                results['successful_portions'] += 1
+                results['portion_results'].append({
+                    'portion_number': portion['portion_number'],
+                    'nakrutka_order_id': nakrutka_order_id,
+                    'quantity': portion_total,
+                    'success': True
+                })
+
+                # Small delay between creating orders
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to create order for portion {portion['portion_number']}",
+                    error=str(e),
+                    order_id=order_id,
+                    exc_info=True
+                )
+
+                results['failed_portions'] += 1
+                results['portion_results'].append({
+                    'portion_number': portion['portion_number'],
+                    'error': str(e),
+                    'success': False
+                })
+
+        # Update main order status
+        if results['successful_portions'] > 0:
+            # At least one portion succeeded
+            await self.db.execute(
+                "UPDATE orders SET status = $1, started_at = $2 WHERE id = $3",
+                ORDER_STATUS["IN_PROGRESS"],
+                datetime.utcnow(),
+                order_id
+            )
+        else:
+            # All portions failed
+            await self.db.execute(
+                "UPDATE orders SET status = $1 WHERE id = $2",
+                ORDER_STATUS["FAILED"],
+                order_id
+            )
+
+        logger.info(
+            f"Nakrutka sending completed",
+            order_id=order_id,
+            successful=results['successful_portions'],
+            failed=results['failed_portions']
+        )
+
+        return results
 
     async def _create_distributed_reactions(
         self,
@@ -596,6 +606,12 @@ class PostProcessor:
             return {'success': True, 'skipped': True}
 
         try:
+            logger.info(
+                f"=== Creating distributed reactions ===",
+                total_quantity=total_quantity,
+                reaction_types=len(reaction_services)
+            )
+
             # Calculate distribution
             distributor = ReactionDistributor(reaction_services)
             distributions = distributor.distribute_reactions(total_quantity)
@@ -746,22 +762,6 @@ class PostProcessor:
 
         return portions
 
-    async def _save_portions(self, order_id: int, portions: List[Dict[str, Any]]):
-        """Save portions to database"""
-        db_portions = [
-            {
-                'order_id': order_id,
-                'portion_number': p['portion_number'],
-                'quantity_per_run': p['quantity_per_run'],
-                'runs': p['runs'],
-                'interval_minutes': p['interval_minutes'],
-                'scheduled_at': p.get('scheduled_at')
-            }
-            for p in portions
-        ]
-
-        await self.queries.create_portions(db_portions)
-
     async def _update_final_post_status(
         self,
         post: Post,
@@ -795,7 +795,7 @@ class PostProcessor:
                         'success': v.get('success', False),
                         'quantity': v.get('quantity', 0),
                         'cost': v.get('cost', 0),
-                        'nakrutka_id': v.get('nakrutka_results', {}).get('nakrutka_order_id')
+                        'portions': v.get('nakrutka_results', {}).get('successful_portions', 0)
                     }
                     for k, v in results.items() if v
                 }
@@ -861,199 +861,196 @@ class PostProcessor:
         )
 
     async def check_order_status(self):
-        """Check status of active orders"""
+        """Check status of active orders and their portions"""
         try:
-            active_orders = await self.queries.get_active_orders()
+            logger.info("=== Checking order statuses ===")
 
-            if not active_orders:
+            # Get all active PORTIONS with their own nakrutka_portion_id
+            active_portions = await self.db.fetch("""
+                SELECT 
+                    op.id as portion_id,
+                    op.order_id,
+                    op.portion_number,
+                    op.nakrutka_portion_id,
+                    op.status as portion_status,
+                    op.quantity_per_run,
+                    op.runs,
+                    o.id as order_id,
+                    o.service_type,
+                    o.total_quantity
+                FROM order_portions op
+                JOIN orders o ON o.id = op.order_id
+                WHERE op.status IN ('waiting', 'running')
+                AND op.nakrutka_portion_id IS NOT NULL
+                ORDER BY op.order_id, op.portion_number
+            """)
+
+            if not active_portions:
+                logger.info("No active portions to check")
                 return
 
-            logger.info(f"Checking status of {len(active_orders)} orders")
+            logger.info(f"Checking {len(active_portions)} active portions")
 
-            # Group by Nakrutka order ID for batch checking
-            nakrutka_ids = [
-                order.nakrutka_order_id
-                for order in active_orders
-                if order.nakrutka_order_id
-            ]
-
-            if not nakrutka_ids:
-                logger.warning("No orders with nakrutka_order_id to check")
-                return
+            # Group by nakrutka IDs for batch checking
+            nakrutka_ids = [p['nakrutka_portion_id'] for p in active_portions]
 
             # Get statuses in batches
             batch_size = 100
             for i in range(0, len(nakrutka_ids), batch_size):
                 batch = nakrutka_ids[i:i + batch_size]
-                await self._check_batch_status(batch, active_orders)
 
-            # Check portion statuses (they all have same nakrutka_order_id as main order)
-            await self._check_portion_statuses()
+                try:
+                    statuses = await self.nakrutka.get_multiple_status(batch)
+
+                    # Process each portion
+                    for portion in active_portions:
+                        if portion['nakrutka_portion_id'] in statuses:
+                            status_info = statuses[portion['nakrutka_portion_id']]
+                            await self._process_portion_status_update(portion, status_info)
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to check batch status",
+                        error=str(e),
+                        batch_size=len(batch)
+                    )
+
+            # Check if all portions of an order are completed
+            await self._check_order_completion()
 
         except Exception as e:
             logger.error("Status check failed", error=str(e), exc_info=True)
 
-    async def _check_batch_status(
+    async def _process_portion_status_update(
         self,
-        batch: List[str],
-        active_orders: List[Order]
-    ):
-        """Check status for a batch of orders"""
-        try:
-            statuses = await self.nakrutka.get_multiple_status(batch)
-
-            for order in active_orders:
-                if not order.nakrutka_order_id or order.nakrutka_order_id not in statuses:
-                    continue
-
-                status_info = statuses.get(order.nakrutka_order_id, {})
-                await self._process_order_status_update(order, status_info)
-
-        except Exception as e:
-            logger.error(
-                f"Failed to check batch status",
-                error=str(e),
-                batch_size=len(batch)
-            )
-
-    async def _process_order_status_update(
-        self,
-        order: Order,
+        portion: Dict[str, Any],
         status_info: Dict[str, Any]
     ):
-        """Process status update for an order"""
+        """Process status update for a portion"""
         nakrutka_status = status_info.get('status', '').lower()
 
-        if nakrutka_status == 'completed':
-            await self.queries.update_order_status(
-                order.id,
-                ORDER_STATUS["COMPLETED"],
-                datetime.utcnow()
-            )
+        logger.info(
+            f"Portion {portion['portion_id']} status",
+            nakrutka_id=portion['nakrutka_portion_id'],
+            status=nakrutka_status,
+            remains=status_info.get('remains', 0)
+        )
 
-            # Update all portions to completed
+        if nakrutka_status == 'completed':
             await self.db.execute(
                 """
                 UPDATE order_portions
                 SET status = $1, completed_at = $2
-                WHERE order_id = $3
+                WHERE id = $3
                 """,
                 PORTION_STATUS["COMPLETED"],
                 datetime.utcnow(),
-                order.id
+                portion['portion_id']
             )
 
             # Record performance
-            await self._record_order_performance(order, status_info)
+            await self._record_portion_performance(portion, status_info)
 
         elif nakrutka_status in ['canceled', 'cancelled']:
-            await self.queries.update_order_status(
-                order.id,
-                ORDER_STATUS["CANCELLED"],
-                datetime.utcnow()
+            await self.db.execute(
+                """
+                UPDATE order_portions
+                SET status = $1, completed_at = $2
+                WHERE id = $3
+                """,
+                PORTION_STATUS["FAILED"],
+                datetime.utcnow(),
+                portion['portion_id']
             )
 
             await self.db_logger.warning(
-                "Order cancelled",
-                order_id=order.id,
-                nakrutka_id=order.nakrutka_order_id,
+                "Portion cancelled",
+                portion_id=portion['portion_id'],
+                nakrutka_id=portion['nakrutka_portion_id'],
                 reason=status_info.get('error', 'Unknown')
             )
 
-        elif nakrutka_status == 'partial':
-            logger.warning(
-                f"Order partially completed",
-                order_id=order.id,
-                remains=status_info.get('remains')
-            )
+    async def _check_order_completion(self):
+        """Check if all portions of orders are completed"""
+        orders = await self.db.fetch("""
+            SELECT 
+                o.id,
+                o.status,
+                COUNT(op.id) as total_portions,
+                COUNT(CASE WHEN op.status = 'completed' THEN 1 END) as completed_portions,
+                COUNT(CASE WHEN op.status = 'failed' THEN 1 END) as failed_portions
+            FROM orders o
+            JOIN order_portions op ON op.order_id = o.id
+            WHERE o.status = 'in_progress'
+            GROUP BY o.id, o.status
+        """)
 
-    async def _record_order_performance(
+        for order in orders:
+            if order['completed_portions'] + order['failed_portions'] == order['total_portions']:
+                # All portions are done
+                if order['failed_portions'] == 0:
+                    # All successful
+                    await self.db.execute(
+                        "UPDATE orders SET status = $1, completed_at = $2 WHERE id = $3",
+                        ORDER_STATUS["COMPLETED"],
+                        datetime.utcnow(),
+                        order['id']
+                    )
+                    logger.info(f"Order {order['id']} completed successfully")
+                else:
+                    # Some failed
+                    await self.db.execute(
+                        "UPDATE orders SET status = $1, completed_at = $2 WHERE id = $3",
+                        ORDER_STATUS["PARTIAL"],
+                        datetime.utcnow(),
+                        order['id']
+                    )
+                    logger.warning(
+                        f"Order {order['id']} partially completed",
+                        failed=order['failed_portions'],
+                        total=order['total_portions']
+                    )
+
+    async def _record_portion_performance(
         self,
-        order: Order,
+        portion: Dict[str, Any],
         status_info: Dict[str, Any]
     ):
-        """Record order performance for optimization"""
+        """Record portion performance for optimization"""
         try:
-            # Get post and channel info
-            post = await self.queries.get_post_by_id(order.post_id)
-            if not post:
-                return
-
             # Calculate completion time
-            if order.started_at:
-                completion_time = datetime.utcnow() - order.started_at
-
-                # Record in optimizer
-                self._optimizer.record_performance(
-                    channel_id=post.channel_id,
-                    service_type=order.service_type,
-                    order_id=order.id,
-                    completion_time=completion_time.total_seconds(),
-                    success=True,
-                    actual_quantity=order.total_quantity - status_info.get('remains', 0),
-                    target_quantity=order.total_quantity,
-                    service_id=order.service_id,
-                    cost=status_info.get('charge', 0)
-                )
-
-        except Exception as e:
-            logger.error(f"Failed to record performance: {e}")
-
-    async def _check_portion_statuses(self):
-        """Check and update portion statuses - they share nakrutka_order_id with main order"""
-        try:
-            # For drip-feed, portions share the same nakrutka_order_id as the main order
-            # We check the main order status to update portions
-
-            query = """
-                SELECT DISTINCT o.id, o.nakrutka_order_id, o.status
-                FROM orders o
-                WHERE o.status = $1
-                AND o.nakrutka_order_id IS NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM order_portions op
-                    WHERE op.order_id = o.id
-                    AND op.status = $2
-                )
-                LIMIT 50
-            """
-
-            orders = await self.db.fetch(
-                query,
-                ORDER_STATUS["IN_PROGRESS"],
-                PORTION_STATUS["RUNNING"]
+            started_at = await self.db.fetchval(
+                "SELECT started_at FROM order_portions WHERE id = $1",
+                portion['portion_id']
             )
 
-            for order in orders:
-                try:
-                    # Get status from Nakrutka
-                    status = await self.nakrutka.get_order_status(order['nakrutka_order_id'])
+            if started_at:
+                completion_time = datetime.utcnow() - started_at
 
-                    if status.get('status', '').lower() == 'completed':
-                        # Update all portions for this order
-                        await self.db.execute(
-                            """
-                            UPDATE order_portions
-                            SET status = $1, completed_at = $2
-                            WHERE order_id = $3
-                            AND status = $4
-                            """,
-                            PORTION_STATUS["COMPLETED"],
-                            datetime.utcnow(),
-                            order['id'],
-                            PORTION_STATUS["RUNNING"]
-                        )
+                # Get post info for channel_id
+                post_info = await self.db.fetchrow("""
+                    SELECT p.channel_id 
+                    FROM posts p
+                    JOIN orders o ON o.post_id = p.id
+                    WHERE o.id = $1
+                """, portion['order_id'])
 
-                        logger.info(f"Updated all portions for order {order['id']} to completed")
-
-                except Exception as e:
-                    logger.error(
-                        f"Failed to check portions for order {order['id']}",
-                        error=str(e)
+                if post_info:
+                    # Record in optimizer
+                    self._optimizer.record_performance(
+                        channel_id=post_info['channel_id'],
+                        service_type=portion['service_type'],
+                        order_id=portion['order_id'],
+                        completion_time=completion_time.total_seconds(),
+                        success=True,
+                        actual_quantity=portion['quantity_per_run'] * portion['runs'] - status_info.get('remains', 0),
+                        target_quantity=portion['quantity_per_run'] * portion['runs'],
+                        service_id=None,  # Would need to get from order
+                        cost=status_info.get('charge', 0)
                     )
 
         except Exception as e:
-            logger.error("Portion status check failed", error=str(e))
+            logger.error(f"Failed to record performance: {e}")
 
     async def retry_failed_orders(self, hours: int = 24):
         """Retry recently failed orders"""

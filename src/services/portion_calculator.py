@@ -1,7 +1,7 @@
 """
-Universal portion calculator for drip-feed distribution - FIXED VERSION
-Порції використовуються тільки для внутрішнього трекінгу.
-Nakrutka отримує ОДНЕ замовлення з загальними параметрами drip-feed.
+Universal portion calculator for multi-order distribution
+FIXED VERSION: Each portion = separate Nakrutka order
+For reposts: only single portion allowed
 """
 from typing import List, Dict, Any, Tuple, Optional, Union
 from datetime import datetime, timedelta
@@ -66,41 +66,60 @@ STRATEGIES = {
         total_hours=24,
         min_portions=8,
         max_portions=12
+    ),
+    'single': DistributionStrategy(
+        name='single',
+        description='Single portion - for reposts',
+        front_load_percent=100,
+        fast_hours=1,
+        total_hours=1,
+        min_portions=1,
+        max_portions=1
     )
 }
 
 
 @dataclass
-class DripFeedParams:
-    """Параметри для Nakrutka drip-feed API"""
-    total_quantity: int      # Загальна кількість
-    quantity_per_run: int    # Кількість на один run
-    runs: int               # Кількість runs
-    interval: int           # Інтервал між runs в хвилинах
+class Portion:
+    """Single portion configuration"""
+    portion_number: int
+    quantity_per_run: int
+    runs: int
+    interval_minutes: int
+    scheduled_at: datetime
+    total_quantity: int
 
     def validate(self, service: Service) -> Tuple[bool, Optional[str]]:
-        """Перевірити параметри для сервісу"""
-        # Перевірка quantity_per_run
+        """Validate portion parameters"""
+        logger.debug(
+            f"Validating portion {self.portion_number}",
+            quantity_per_run=self.quantity_per_run,
+            runs=self.runs,
+            service_min=service.min_quantity,
+            service_max=service.max_quantity
+        )
+
+        # Check quantity per run
         if self.quantity_per_run < service.min_quantity:
             return False, f"Quantity per run {self.quantity_per_run} < min {service.min_quantity}"
 
         if self.quantity_per_run > service.max_quantity:
             return False, f"Quantity per run {self.quantity_per_run} > max {service.max_quantity}"
 
-        # Перевірка загальної кількості
+        # Check total
         actual_total = self.quantity_per_run * self.runs
-        if abs(actual_total - self.total_quantity) > self.runs:  # Допустима похибка
+        if abs(actual_total - self.total_quantity) > self.runs:
             return False, f"Total mismatch: {actual_total} vs {self.total_quantity}"
 
-        # Перевірка runs
+        # Check runs
         if self.runs < 1:
             return False, "Runs must be >= 1"
 
-        if self.runs > 1000:  # Nakrutka limit
-            return False, "Runs must be <= 1000"
+        if self.runs > 1000:
+            return False, "Runs must be <= 1000 (Nakrutka limit)"
 
-        # Перевірка інтервалу
-        if self.runs > 1 and self.interval < 5:
+        # Check interval
+        if self.runs > 1 and self.interval_minutes < 5:
             return False, "Interval must be >= 5 minutes for drip-feed"
 
         return True, None
@@ -108,8 +127,7 @@ class DripFeedParams:
 
 class OptimizedPortionCalculator:
     """
-    Enhanced portion calculator that creates proper drip-feed parameters
-    ВАЖЛИВО: Порції - це лише для внутрішнього трекінгу прогресу!
+    Portion calculator - each portion creates separate Nakrutka order
     """
 
     def __init__(self, templates: Optional[List[PortionTemplate]] = None):
@@ -146,261 +164,316 @@ class OptimizedPortionCalculator:
                 diff = Decimal('100') - Decimal(str(new_total))
                 self.templates[-1].quantity_percent += diff
 
-    def calculate_drip_feed_params(
-        self,
-        total_quantity: int,
-        service: Service,
-        strategy: Optional[str] = None
-    ) -> DripFeedParams:
-        """
-        Розрахувати параметри для ОДНОГО drip-feed замовлення Nakrutka
-
-        Returns:
-            DripFeedParams для відправки в Nakrutka API
-        """
-        if not strategy:
-            strategy = self._auto_select_strategy(total_quantity, service)
-
-        self._strategy = STRATEGIES.get(strategy, STRATEGIES['standard'])
-
-        # Визначаємо оптимальну кількість runs
-        if total_quantity < 500:
-            # Малі замовлення - менше runs
-            target_runs = 10
-        elif total_quantity < 5000:
-            # Середні замовлення
-            target_runs = 30
-        elif total_quantity < 50000:
-            # Великі замовлення
-            target_runs = 100
-        else:
-            # Дуже великі замовлення
-            target_runs = 200
-
-        # Розраховуємо quantity_per_run
-        quantity_per_run = max(
-            service.min_quantity,
-            total_quantity // target_runs
-        )
-
-        # Перевіряємо максимум
-        if quantity_per_run > service.max_quantity:
-            quantity_per_run = service.max_quantity
-
-        # Перераховуємо runs
-        runs = math.ceil(total_quantity / quantity_per_run)
-
-        # Обмеження Nakrutka
-        if runs > 1000:
-            runs = 1000
-            quantity_per_run = math.ceil(total_quantity / runs)
-
-        # Розраховуємо інтервал
-        # Загальний час виконання в хвилинах
-        total_minutes = self._strategy.total_hours * 60
-
-        # Інтервал = загальний час / кількість runs
-        interval = max(5, total_minutes // runs) if runs > 1 else 0
-
-        # Створюємо параметри
-        params = DripFeedParams(
-            total_quantity=total_quantity,
-            quantity_per_run=quantity_per_run,
-            runs=runs,
-            interval=interval
-        )
-
-        # Валідація
-        valid, error = params.validate(service)
-        if not valid:
-            logger.warning(f"Initial params invalid: {error}, adjusting...")
-            # Спробуємо виправити
-            params = self._fix_drip_feed_params(params, service)
-
-        logger.info(
-            f"Calculated drip-feed params",
-            total=total_quantity,
-            per_run=params.quantity_per_run,
-            runs=params.runs,
-            interval=params.interval,
-            strategy=strategy
-        )
-
-        return params
-
     def calculate_portions(
         self,
         total_quantity: int,
         service: Service,
         start_time: Optional[datetime] = None,
         strategy: Optional[str] = None,
-        force_portions: Optional[int] = None
+        force_single: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        Calculate portions for INTERNAL TRACKING ONLY
-        Порції НЕ відправляються в Nakrutka як окремі замовлення!
+        Calculate portions for creating multiple orders
+
+        Args:
+            total_quantity: Total quantity to distribute
+            service: Service with limits
+            start_time: When to start
+            strategy: Distribution strategy
+            force_single: Force single portion (for reposts)
 
         Returns:
-            List of portions for database tracking
+            List of portion configurations
         """
         if not start_time:
             start_time = datetime.utcnow()
 
-        # Отримуємо параметри drip-feed
-        drip_params = self.calculate_drip_feed_params(total_quantity, service, strategy)
+        logger.info(
+            f"=== Calculating portions ===",
+            total_quantity=total_quantity,
+            service_id=service.nakrutka_id,
+            service_name=service.service_name,
+            force_single=force_single,
+            strategy=strategy
+        )
 
-        # Тепер створюємо порції для внутрішнього трекінгу
-        # Вони відображають як буде розподілятися накрутка в часі
-        if self.templates and not force_portions:
-            portions = self._calculate_tracking_portions_from_templates(
-                drip_params, start_time
+        # Force single portion for reposts or if requested
+        if force_single or service.service_type == 'reposts':
+            logger.info("Using single portion strategy")
+            return self._create_single_portion(total_quantity, service, start_time)
+
+        # Use templates or dynamic calculation
+        if self.templates:
+            logger.info(f"Using {len(self.templates)} templates")
+            portions = self._calculate_from_templates(
+                total_quantity, service, start_time
             )
         else:
-            portions = self._calculate_tracking_portions_dynamic(
-                drip_params, start_time, force_portions
+            logger.info("Using dynamic calculation")
+            portions = self._calculate_dynamic(
+                total_quantity, service, start_time, strategy
             )
 
-        # Додаємо drip-feed параметри до кожної порції
-        for portion in portions:
-            portion['drip_feed_params'] = {
-                'quantity_per_run': drip_params.quantity_per_run,
-                'runs': drip_params.runs,
-                'interval': drip_params.interval
-            }
+        # Validate all portions
+        self._validate_portions(portions, service, total_quantity)
+
+        logger.info(
+            f"Calculated {len(portions)} portions",
+            total_runs=sum(p['runs'] for p in portions),
+            actual_total=sum(p['quantity_per_run'] * p['runs'] for p in portions)
+        )
 
         return portions
 
-    def _calculate_tracking_portions_from_templates(
+    def _create_single_portion(
         self,
-        drip_params: DripFeedParams,
+        quantity: int,
+        service: Service,
         start_time: datetime
     ) -> List[Dict[str, Any]]:
-        """Створити порції для трекінгу на основі шаблонів"""
-        portions = []
-        total_runs = drip_params.runs
+        """Create single portion (for reposts)"""
+        # Adjust quantity to service limits
+        adjusted = max(service.min_quantity, min(quantity, service.max_quantity))
 
-        # Розподіляємо runs між порціями відповідно до шаблонів
-        remaining_runs = total_runs
+        if adjusted != quantity:
+            logger.warning(
+                f"Adjusted quantity for single portion",
+                original=quantity,
+                adjusted=adjusted,
+                limits=(service.min_quantity, service.max_quantity)
+            )
+
+        return [{
+            'portion_number': 1,
+            'quantity_per_run': adjusted,
+            'runs': 1,
+            'interval_minutes': 0,
+            'scheduled_at': start_time,
+            'total_quantity': adjusted
+        }]
+
+    def _calculate_from_templates(
+        self,
+        total_quantity: int,
+        service: Service,
+        start_time: datetime
+    ) -> List[Dict[str, Any]]:
+        """Calculate portions from templates"""
+        portions = []
+        remaining = total_quantity
+        current_time = start_time
 
         for i, template in enumerate(self.templates):
+            # Calculate quantity for this portion
             if i == len(self.templates) - 1:
-                # Остання порція отримує всі runs що залишилися
-                portion_runs = remaining_runs
+                # Last portion gets remaining
+                portion_quantity = remaining
             else:
-                # Розподіляємо пропорційно
-                portion_runs = int(total_runs * float(template.quantity_percent) / 100)
-                portion_runs = max(1, portion_runs)
+                portion_quantity = int(total_quantity * float(template.quantity_percent) / 100)
+                portion_quantity = max(1, portion_quantity)
 
-            if portion_runs <= 0:
+            if portion_quantity <= 0:
                 continue
 
-            # Кількість для цієї порції
-            portion_quantity = portion_runs * drip_params.quantity_per_run
+            logger.debug(
+                f"Processing template {template.portion_number}",
+                percent=float(template.quantity_percent),
+                calculated_quantity=portion_quantity
+            )
 
-            # Час початку цієї порції
-            # Розраховуємо коли почнеться перший run цієї порції
-            runs_before = total_runs - remaining_runs
-            start_delay = runs_before * drip_params.interval
+            # Parse runs formula
+            quantity_per_run, runs = self._parse_runs_formula(
+                template.runs_formula,
+                portion_quantity,
+                service
+            )
 
-            portions.append({
+            # Schedule time
+            if template.start_delay_minutes > 0:
+                scheduled_at = start_time + timedelta(minutes=template.start_delay_minutes)
+            else:
+                scheduled_at = current_time
+
+            # Create portion
+            portion = {
                 'portion_number': template.portion_number,
-                'quantity_per_run': drip_params.quantity_per_run,
-                'runs': portion_runs,
-                'interval_minutes': drip_params.interval,
-                'scheduled_at': start_time + timedelta(minutes=start_delay),
-                'total_quantity': portion_quantity,
-                'template_percent': float(template.quantity_percent),
-                'tracking_info': {
-                    'first_run_index': runs_before + 1,
-                    'last_run_index': runs_before + portion_runs,
-                    'duration_minutes': (portion_runs - 1) * drip_params.interval
-                }
-            })
+                'quantity_per_run': quantity_per_run,
+                'runs': runs,
+                'interval_minutes': template.interval_minutes,
+                'scheduled_at': scheduled_at,
+                'total_quantity': quantity_per_run * runs,
+                'template_percent': float(template.quantity_percent)
+            }
 
-            remaining_runs -= portion_runs
+            portions.append(portion)
+            remaining -= portion['total_quantity']
+
+            # Update current time for next portion
+            if runs > 1:
+                duration = (runs - 1) * template.interval_minutes
+                current_time = scheduled_at + timedelta(minutes=duration)
+            else:
+                current_time = scheduled_at
+
+            logger.debug(
+                f"Created portion {template.portion_number}",
+                quantity_per_run=quantity_per_run,
+                runs=runs,
+                total=quantity_per_run * runs
+            )
 
         return portions
 
-    def _calculate_tracking_portions_dynamic(
+    def _calculate_dynamic(
         self,
-        drip_params: DripFeedParams,
+        total_quantity: int,
+        service: Service,
         start_time: datetime,
-        force_portions: Optional[int] = None
+        strategy: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Створити порції для трекінгу динамічно"""
-        num_portions = force_portions or 5  # За замовчуванням 5 порцій
+        """Calculate portions dynamically without templates"""
+        if not strategy:
+            strategy = self._auto_select_strategy(total_quantity, service)
+
+        self._strategy = STRATEGIES.get(strategy, STRATEGIES['standard'])
+
+        logger.info(f"Using {strategy} strategy for dynamic calculation")
+
+        # Determine number of portions
+        if total_quantity < 100:
+            num_portions = 2
+        elif total_quantity < 1000:
+            num_portions = min(5, self._strategy.max_portions)
+        elif total_quantity < 10000:
+            num_portions = min(7, self._strategy.max_portions)
+        else:
+            num_portions = self._strategy.max_portions
+
+        # Distribute quantities
         portions = []
+        remaining = total_quantity
 
-        # Розподіляємо runs між порціями
-        runs_per_portion = drip_params.runs // num_portions
-        extra_runs = drip_params.runs % num_portions
-
-        current_run_index = 0
-
+        # Use decreasing distribution
         for i in range(num_portions):
-            # Додаємо extra runs до перших порцій
-            portion_runs = runs_per_portion + (1 if i < extra_runs else 0)
+            if i == num_portions - 1:
+                # Last portion gets remaining
+                portion_quantity = remaining
+            else:
+                # Calculate based on strategy
+                if i < num_portions // 2:
+                    # Front-loaded portions
+                    percent = self._strategy.front_load_percent / (num_portions // 2)
+                else:
+                    # Back-loaded portions
+                    percent = (100 - self._strategy.front_load_percent) / (num_portions - num_portions // 2)
 
-            if portion_runs <= 0:
+                portion_quantity = int(total_quantity * percent / 100)
+                portion_quantity = max(service.min_quantity, portion_quantity)
+
+            if portion_quantity <= 0:
                 continue
 
-            # Час початку цієї порції
-            start_delay = current_run_index * drip_params.interval
+            # Calculate runs and quantity per run
+            optimal_runs = self._calculate_optimal_runs(portion_quantity, service)
+            quantity_per_run = portion_quantity // optimal_runs
 
-            portions.append({
+            # Adjust for service limits
+            if quantity_per_run < service.min_quantity:
+                quantity_per_run = service.min_quantity
+                optimal_runs = portion_quantity // quantity_per_run
+            elif quantity_per_run > service.max_quantity:
+                quantity_per_run = service.max_quantity
+                optimal_runs = math.ceil(portion_quantity / quantity_per_run)
+
+            # Calculate interval based on strategy
+            if i < num_portions // 2:
+                interval = 15 + i * 3  # Increasing intervals for front portions
+            else:
+                interval = 30 + (i - num_portions // 2) * 10  # Longer intervals for back portions
+
+            # Schedule time
+            if i == 0:
+                scheduled_at = start_time
+            else:
+                # Add some delay between portions
+                scheduled_at = start_time + timedelta(minutes=i * 20)
+
+            portion = {
                 'portion_number': i + 1,
-                'quantity_per_run': drip_params.quantity_per_run,
-                'runs': portion_runs,
-                'interval_minutes': drip_params.interval,
-                'scheduled_at': start_time + timedelta(minutes=start_delay),
-                'total_quantity': portion_runs * drip_params.quantity_per_run,
-                'tracking_info': {
-                    'first_run_index': current_run_index + 1,
-                    'last_run_index': current_run_index + portion_runs,
-                    'duration_minutes': (portion_runs - 1) * drip_params.interval
-                }
-            })
+                'quantity_per_run': quantity_per_run,
+                'runs': optimal_runs,
+                'interval_minutes': interval,
+                'scheduled_at': scheduled_at,
+                'total_quantity': quantity_per_run * optimal_runs
+            }
 
-            current_run_index += portion_runs
+            portions.append(portion)
+            remaining -= portion['total_quantity']
+
+            logger.debug(
+                f"Dynamic portion {i+1}",
+                quantity=portion['total_quantity'],
+                runs=optimal_runs,
+                interval=interval
+            )
 
         return portions
 
-    def _fix_drip_feed_params(
+    def _parse_runs_formula(
         self,
-        params: DripFeedParams,
+        formula: str,
+        portion_quantity: int,
         service: Service
-    ) -> DripFeedParams:
-        """Спробувати виправити невалідні параметри"""
-        # Якщо quantity_per_run занадто малий
-        if params.quantity_per_run < service.min_quantity:
-            params.quantity_per_run = service.min_quantity
-            params.runs = math.ceil(params.total_quantity / params.quantity_per_run)
+    ) -> Tuple[int, int]:
+        """Parse runs formula from template"""
+        if formula.startswith('quantity/'):
+            # Formula like "quantity/134"
+            divisor = int(formula.replace('quantity/', ''))
+            quantity_per_run = divisor
+            runs = max(1, math.ceil(portion_quantity / divisor))
 
-        # Якщо quantity_per_run занадто великий
-        if params.quantity_per_run > service.max_quantity:
-            params.quantity_per_run = service.max_quantity
-            params.runs = math.ceil(params.total_quantity / params.quantity_per_run)
+            # Adjust for service limits
+            if quantity_per_run < service.min_quantity:
+                quantity_per_run = service.min_quantity
+                runs = max(1, portion_quantity // quantity_per_run)
+            elif quantity_per_run > service.max_quantity:
+                quantity_per_run = service.max_quantity
+                runs = max(1, math.ceil(portion_quantity / quantity_per_run))
+        else:
+            # Fixed runs
+            runs = max(1, int(formula) if formula.isdigit() else 1)
+            quantity_per_run = max(1, portion_quantity // runs)
 
-        # Якщо забагато runs
-        if params.runs > 1000:
-            params.runs = 1000
-            params.quantity_per_run = math.ceil(params.total_quantity / params.runs)
+            # Adjust for service limits
+            if quantity_per_run < service.min_quantity:
+                quantity_per_run = service.min_quantity
+                runs = max(1, portion_quantity // quantity_per_run)
+            elif quantity_per_run > service.max_quantity:
+                quantity_per_run = service.max_quantity
+                runs = max(1, math.ceil(portion_quantity / quantity_per_run))
 
-            # Перевіряємо чи вкладаємося в ліміти
-            if params.quantity_per_run > service.max_quantity:
-                # Доведеться зменшити total_quantity
-                params.quantity_per_run = service.max_quantity
-                params.total_quantity = params.quantity_per_run * params.runs
-                logger.warning(
-                    f"Had to reduce total quantity from {params.total_quantity} "
-                    f"to {params.quantity_per_run * params.runs} due to limits"
-                )
+        return quantity_per_run, runs
 
-        # Фіксимо інтервал
-        if params.runs > 1 and params.interval < 5:
-            params.interval = 5
+    def _calculate_optimal_runs(
+        self,
+        quantity: int,
+        service: Service
+    ) -> int:
+        """Calculate optimal number of runs for quantity"""
+        # Target quantity per run (prefer middle of service range)
+        target_per_run = (service.min_quantity + service.max_quantity) // 3
 
-        return params
+        # Calculate runs
+        if quantity <= service.max_quantity:
+            return 1  # Single run if fits
+
+        runs = max(1, quantity // target_per_run)
+
+        # Limit runs
+        if runs > 50:
+            runs = 50  # Reasonable limit
+
+        return runs
 
     def _auto_select_strategy(self, total_quantity: int, service: Service) -> str:
         """Auto-select best strategy based on quantity and service"""
@@ -419,24 +492,71 @@ class OptimizedPortionCalculator:
         # Default to standard
         return 'standard'
 
-    def get_simple_order_params(
+    def _validate_portions(
         self,
-        quantity: int,
-        service: Service
-    ) -> Dict[str, Any]:
-        """
-        Для простих замовлень без drip-feed (одноразова накрутка)
-        """
-        # Перевіряємо ліміти
-        if quantity < service.min_quantity:
-            quantity = service.min_quantity
-        elif quantity > service.max_quantity:
-            quantity = service.max_quantity
+        portions: List[Dict[str, Any]],
+        service: Service,
+        total_quantity: int
+    ):
+        """Validate all portions"""
+        total_calculated = sum(p['total_quantity'] for p in portions)
 
-        return {
-            'quantity': quantity,
-            'drip_feed': False
-        }
+        if abs(total_calculated - total_quantity) > len(portions):
+            logger.warning(
+                f"Total quantity mismatch",
+                expected=total_quantity,
+                calculated=total_calculated,
+                difference=abs(total_calculated - total_quantity)
+            )
+
+        for portion in portions:
+            p = Portion(
+                portion_number=portion['portion_number'],
+                quantity_per_run=portion['quantity_per_run'],
+                runs=portion['runs'],
+                interval_minutes=portion['interval_minutes'],
+                scheduled_at=portion['scheduled_at'],
+                total_quantity=portion['total_quantity']
+            )
+
+            valid, error = p.validate(service)
+            if not valid:
+                logger.error(
+                    f"Invalid portion {portion['portion_number']}",
+                    error=error
+                )
+                # Try to fix
+                self._fix_invalid_portion(portion, service)
+
+    def _fix_invalid_portion(
+        self,
+        portion: Dict[str, Any],
+        service: Service
+    ):
+        """Try to fix invalid portion"""
+        quantity_per_run = portion['quantity_per_run']
+        runs = portion['runs']
+        total = portion['total_quantity']
+
+        # Fix quantity per run
+        if quantity_per_run < service.min_quantity:
+            quantity_per_run = service.min_quantity
+        elif quantity_per_run > service.max_quantity:
+            quantity_per_run = service.max_quantity
+
+        # Recalculate runs
+        runs = max(1, total // quantity_per_run)
+
+        # Update portion
+        portion['quantity_per_run'] = quantity_per_run
+        portion['runs'] = runs
+        portion['total_quantity'] = quantity_per_run * runs
+
+        logger.info(
+            f"Fixed portion {portion['portion_number']}",
+            new_quantity_per_run=quantity_per_run,
+            new_runs=runs
+        )
 
 
 class ReactionDistributor:
@@ -474,7 +594,7 @@ class ReactionDistributor:
     ) -> List[Dict[str, Any]]:
         """
         Distribute total reactions across services proportionally
-        ДЛЯ КОЖНОЇ РЕАКЦІЇ БУДЕ ОКРЕМЕ ЗАМОВЛЕННЯ В NAKRUTKA!
+        Each reaction type will get its own order!
 
         Args:
             total_quantity: Total reactions to distribute (already randomized if needed)
@@ -484,6 +604,13 @@ class ReactionDistributor:
         Returns:
             List of distributions with service details
         """
+        logger.info(
+            f"=== Distributing reactions ===",
+            total_quantity=total_quantity,
+            services=len(self.services),
+            randomized=randomized
+        )
+
         # Calculate total target from configuration
         config_total = sum(s.target_quantity for s in self.services)
 
@@ -534,13 +661,20 @@ class ReactionDistributor:
 
                 remaining -= quantity
 
+                logger.debug(
+                    f"Reaction distribution",
+                    emoji=service.emoji,
+                    service_id=service.service_id,
+                    quantity=quantity,
+                    proportion=f"{proportion*100:.1f}%"
+                )
+
         # Log distribution stats
         logger.info(
-            "Reaction distribution calculated",
+            "Reaction distribution completed",
             total_quantity=total_quantity,
             distributions=len(distributions),
-            remaining=remaining,
-            randomized=randomized
+            remaining=remaining
         )
 
         # Validate distribution
@@ -599,6 +733,15 @@ def calculate_adaptive_distribution(
     # Default strategy
     strategy = 'standard'
 
+    # Force single for reposts
+    if service_type == 'reposts':
+        return {
+            'strategy': 'single',
+            'portions': 1,
+            'front_load_percent': 100,
+            'notes': 'Single portion for reposts'
+        }
+
     # Analyze historical performance if available
     if historical_performance:
         avg_completion_time = historical_performance.get('avg_completion_hours', 24)
@@ -624,10 +767,6 @@ def calculate_adaptive_distribution(
         # Reactions should be more natural
         if strategy == 'aggressive':
             strategy = 'standard'
-    elif service_type == 'reposts':
-        # Reposts should be smoothest
-        if strategy in ['aggressive', 'standard']:
-            strategy = 'smooth'
 
     # Quantity-based adjustments
     if total_quantity < 100:

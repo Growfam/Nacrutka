@@ -1,5 +1,6 @@
 """
 Database queries - Enhanced with proper reaction services handling
+FIXED: Each portion creates separate Nakrutka order
 """
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
@@ -300,9 +301,11 @@ class Queries:
         post_url: str
     ) -> Optional[int]:
         """Create new post record"""
+        logger.info(f"Creating post record for {post_url}")
+
         query = """
-            INSERT INTO posts (channel_id, post_id, post_url, status)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO posts (channel_id, post_id, post_url, status, published_at)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (channel_id, post_id) DO NOTHING
             RETURNING id
         """
@@ -311,8 +314,15 @@ class Queries:
             channel_id,
             post_id,
             post_url,
-            POST_STATUS["NEW"]
+            POST_STATUS["NEW"],
+            datetime.utcnow()
         )
+
+        if result:
+            logger.info(f"Created post with id: {result}")
+        else:
+            logger.warning(f"Post already exists: {post_url}")
+
         return result
 
     async def get_new_posts(self, limit: int = 10) -> List[Post]:
@@ -336,6 +346,8 @@ class Queries:
         processed_at: Optional[datetime] = None
     ):
         """Update post status"""
+        logger.info(f"Updating post {post_id} status to {status}")
+
         if processed_at:
             query = """
                 UPDATE posts 
@@ -365,7 +377,7 @@ class Queries:
         rows = await self.db.fetch(query % hours)
         return [Post.from_db_row(dict(row)) for row in rows]
 
-    # ============ ORDERS ============
+    # ============ ORDERS - FIXED FOR MULTI-PORTION ============
 
     async def create_order(
         self,
@@ -375,7 +387,15 @@ class Queries:
         total_quantity: int,
         start_delay_minutes: int = 0
     ) -> int:
-        """Create new order"""
+        """Create new order (main record only, portions created separately)"""
+        logger.info(
+            f"Creating order",
+            post_id=post_id,
+            service_type=service_type,
+            service_id=service_id,
+            total_quantity=total_quantity
+        )
+
         query = """
             INSERT INTO orders (
                 post_id, service_type, service_id, 
@@ -393,6 +413,8 @@ class Queries:
             start_delay_minutes,
             ORDER_STATUS["PENDING"]
         )
+
+        logger.info(f"Created order with id: {order_id}")
         return order_id
 
     async def create_order_with_validation(
@@ -420,14 +442,22 @@ class Queries:
             start_delay_minutes=request.start_delay_minutes
         )
 
-        # Create portions
-        if order_id and request.portions:
-            await self.create_portions_batch(order_id, request.portions)
+        # NOTE: Portions are now created AFTER Nakrutka API calls
+        logger.info(f"Order {order_id} created, portions will be added after Nakrutka calls")
 
         return order_id
 
     async def update_order_nakrutka_id(self, order_id: int, nakrutka_id: str) -> bool:
-        """Update order with Nakrutka order ID and return success status"""
+        """
+        Update order with Nakrutka order ID
+        NOTE: This is rarely used now since each portion has its own nakrutka_id
+        """
+        logger.warning(
+            f"Updating main order nakrutka_id (legacy)",
+            order_id=order_id,
+            nakrutka_id=nakrutka_id
+        )
+
         query = """
             UPDATE orders 
             SET nakrutka_order_id = $1,
@@ -443,25 +473,31 @@ class Queries:
             order_id
         )
 
-        # Check if update was successful
-        success = result == "UPDATE 1"
+        # Log the actual result
+        logger.info(f"DB execute result: {result}, type: {type(result)}")
 
-        if success:
-            logger.info(f"Successfully updated order {order_id} with nakrutka_id {nakrutka_id}")
+        # Check different possible return formats
+        if result == "UPDATE 1":
+            success = True
+        elif isinstance(result, str) and "UPDATE" in result:
+            success = True
+        elif isinstance(result, int):
+            success = result > 0
         else:
-            logger.error(f"Failed to update order {order_id} with nakrutka_id {nakrutka_id}, result: {result}")
+            success = result is not None
 
+        logger.info(f"Update order {order_id} success: {success}")
         return success
 
     async def verify_order_update(self, order_id: int) -> Optional[str]:
-        """Verify order was updated with nakrutka_order_id"""
+        """Verify order was updated with nakrutka_order_id (legacy)"""
         query = "SELECT nakrutka_order_id FROM orders WHERE id = $1"
         nakrutka_id = await self.db.fetchval(query, order_id)
 
         if nakrutka_id:
             logger.info(f"Order {order_id} verified with nakrutka_id: {nakrutka_id}")
         else:
-            logger.error(f"Order {order_id} has NULL nakrutka_order_id!")
+            logger.warning(f"Order {order_id} has NULL nakrutka_order_id (expected for multi-portion orders)")
 
         return nakrutka_id
 
@@ -494,6 +530,8 @@ class Queries:
         cost: Optional[Decimal] = None
     ):
         """Update order status with additional info"""
+        logger.info(f"Updating order {order_id} status to {status}")
+
         if completed_at:
             query = """
                 UPDATE orders 
@@ -541,10 +579,15 @@ class Queries:
 
         return [Order.from_db_row(dict(row)) for row in rows]
 
-    # ============ PORTIONS ============
+    # ============ PORTIONS - FIXED FOR SEPARATE ORDERS ============
 
     async def create_portions(self, portions: List[Dict[str, Any]]):
-        """Create multiple order portions"""
+        """
+        DEPRECATED: Use create_portion_with_nakrutka_id instead
+        Old method kept for compatibility
+        """
+        logger.warning("Using deprecated create_portions method")
+
         if not portions:
             return
 
@@ -572,8 +615,58 @@ class Queries:
         for portion_data in data:
             await self.db.execute(query, *portion_data)
 
+    async def create_portion_with_nakrutka_id(
+        self,
+        order_id: int,
+        portion_number: int,
+        quantity_per_run: int,
+        runs: int,
+        interval_minutes: int,
+        nakrutka_portion_id: str,
+        scheduled_at: Optional[datetime] = None
+    ) -> int:
+        """Create portion WITH nakrutka_id (after successful API call)"""
+        logger.info(
+            f"Creating portion with nakrutka_id",
+            order_id=order_id,
+            portion_number=portion_number,
+            nakrutka_id=nakrutka_portion_id,
+            quantity_per_run=quantity_per_run,
+            runs=runs
+        )
+
+        query = """
+            INSERT INTO order_portions (
+                order_id, portion_number, quantity_per_run,
+                runs, interval_minutes, nakrutka_portion_id,
+                status, scheduled_at, started_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id
+        """
+
+        portion_id = await self.db.fetchval(
+            query,
+            order_id,
+            portion_number,
+            quantity_per_run,
+            runs,
+            interval_minutes,
+            nakrutka_portion_id,
+            PORTION_STATUS["RUNNING"],
+            scheduled_at,
+            datetime.utcnow()
+        )
+
+        logger.info(f"Created portion {portion_id} with nakrutka_id {nakrutka_portion_id}")
+        return portion_id
+
     async def create_portions_batch(self, order_id: int, portions: List[Dict[str, Any]]):
-        """Create portions for a single order"""
+        """
+        DEPRECATED: Each portion should be created separately after Nakrutka call
+        """
+        logger.warning("Using deprecated create_portions_batch")
+
         if not portions:
             return
 
@@ -591,7 +684,11 @@ class Queries:
             ORDER BY portion_number
         """
         rows = await self.db.fetch(query, order_id)
-        return [OrderPortion.from_db_row(dict(row)) for row in rows]
+
+        portions = [OrderPortion.from_db_row(dict(row)) for row in rows]
+        logger.info(f"Found {len(portions)} portions for order {order_id}")
+
+        return portions
 
     async def update_portion_status(
         self,
@@ -600,6 +697,12 @@ class Queries:
         nakrutka_id: Optional[str] = None
     ):
         """Update portion status"""
+        logger.info(
+            f"Updating portion {portion_id} status",
+            new_status=status,
+            has_nakrutka_id=nakrutka_id is not None
+        )
+
         if nakrutka_id:
             query = """
                 UPDATE order_portions 
@@ -627,27 +730,24 @@ class Queries:
         status: str,
         nakrutka_id: str
     ):
-        """Update all portions for an order with same nakrutka_id"""
-        query = """
-            UPDATE order_portions 
-            SET status = $1, 
-                nakrutka_portion_id = $2, 
-                started_at = $3
-            WHERE order_id = $4
         """
-        result = await self.db.execute(
-            query,
-            status,
-            nakrutka_id,
-            datetime.utcnow(),
-            order_id
+        DEPRECATED: Each portion should have its own nakrutka_id
+        """
+        logger.error(
+            f"DEPRECATED: Trying to update all portions with same nakrutka_id",
+            order_id=order_id,
+            nakrutka_id=nakrutka_id
         )
 
-        logger.info(f"Updated portions for order {order_id}: {result}")
-        return result
+        # This should not be used anymore!
+        raise Exception("Each portion must have its own nakrutka_id!")
 
     async def get_scheduled_portions(self) -> List[OrderPortion]:
-        """Get portions ready to be executed"""
+        """
+        DEPRECATED: Portions are now created with nakrutka_id already
+        """
+        logger.warning("get_scheduled_portions is deprecated")
+
         query = """
             SELECT op.* 
             FROM order_portions op
@@ -666,6 +766,32 @@ class Queries:
             ORDER_STATUS["IN_PROGRESS"]
         )
         return [OrderPortion.from_db_row(dict(row)) for row in rows]
+
+    async def get_active_portions_with_nakrutka_ids(self) -> List[Dict[str, Any]]:
+        """Get all active portions that have nakrutka_portion_id"""
+        query = """
+            SELECT 
+                op.*,
+                o.service_type,
+                o.service_id,
+                p.channel_id
+            FROM order_portions op
+            JOIN orders o ON o.id = op.order_id
+            JOIN posts p ON p.id = o.post_id
+            WHERE op.status IN ($1, $2)
+            AND op.nakrutka_portion_id IS NOT NULL
+            ORDER BY op.created_at
+            LIMIT 100
+        """
+
+        rows = await self.db.fetch(
+            query,
+            PORTION_STATUS["WAITING"],
+            PORTION_STATUS["RUNNING"]
+        )
+
+        logger.info(f"Found {len(rows)} active portions with nakrutka_ids")
+        return [dict(row) for row in rows]
 
     # ============ SERVICES (ENHANCED) ============
 
@@ -822,7 +948,7 @@ class Queries:
 
             scored_services.append((service, score))
 
-        # Sort by score
+        # Sort by score descending
         scored_services.sort(key=lambda x: x[1], reverse=True)
 
         return scored_services[0][0] if scored_services else None
@@ -878,12 +1004,8 @@ class Queries:
             ('reactions', 4, 6.06, 'quantity/2', 20, 0),
             ('reactions', 5, 16.67, 'quantity/1', 15, 45),
 
-            # Reposts
-            ('reposts', 1, 26.09, 'quantity/2', 10, 5),
-            ('reposts', 2, 17.39, 'quantity/2', 12, 5),
-            ('reposts', 3, 13.04, 'quantity/1', 15, 5),
-            ('reposts', 4, 8.70, 'quantity/1', 18, 5),
-            ('reposts', 5, 34.78, 'quantity/2', 15, 45),
+            # Reposts - ONLY ONE PORTION!
+            ('reposts', 1, 100.00, '1', 0, 5),
         ]
 
         query = """
