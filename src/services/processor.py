@@ -12,15 +12,58 @@ from src.database.models import *
 from src.services.nakrutka import NakrutkaClient, NakrutkaError
 from src.services.portion_calculator import (
     PortionCalculator,
-    ReactionDistributor,
-    DynamicPortionOptimizer
+    ReactionDistributor
 )
+from src.services.optimizer import DynamicPortionOptimizer
 from src.config import POST_STATUS, ORDER_STATUS, PORTION_STATUS, SERVICE_TYPES
 from src.utils.logger import get_logger, DatabaseLogger
 from src.utils.helpers import calculate_cost, ErrorRecovery
-from src.utils.validators import DataValidator, OrderValidator, validate_before_processing
+from src.utils.validators import DataValidator, OrderValidator
 
 logger = get_logger(__name__)
+
+
+class ValidationError(Exception):
+    """Validation error for processing"""
+    pass
+
+
+def validate_before_processing(
+    post: Post,
+    channel_settings: ChannelSettings,
+    portion_templates: Dict[str, List[PortionTemplate]]
+) -> List[str]:
+    """Comprehensive validation before processing a post"""
+    errors = []
+
+    # Validate post
+    valid, error = DataValidator.validate_post(post)
+    if not valid:
+        errors.append(f"Post validation: {error}")
+
+    # Validate settings
+    valid, error = DataValidator.validate_channel_settings(channel_settings)
+    if not valid:
+        errors.append(f"Settings validation: {error}")
+
+    # Validate templates for each service type
+    for service_type in ['views', 'reactions', 'reposts']:
+        templates = portion_templates.get(service_type, [])
+
+        # Skip if no target for this type
+        if service_type == 'views' and channel_settings.views_target == 0:
+            continue
+        if service_type == 'reactions' and channel_settings.reactions_target == 0:
+            continue
+        if service_type == 'reposts' and channel_settings.reposts_target == 0:
+            continue
+
+        if templates:
+            valid, error = DataValidator.validate_portion_templates(templates, service_type)
+            if not valid:
+                errors.append(f"Templates validation for {service_type}: {error}")
+
+    return errors
 
 
 class PostProcessor:
@@ -546,7 +589,7 @@ class PostProcessor:
                 'quantity_per_run': p['quantity_per_run'],
                 'runs': p['runs'],
                 'interval_minutes': p['interval_minutes'],
-                'scheduled_at': p['scheduled_at']
+                'scheduled_at': p.get('scheduled_at')
             }
             for p in portions
         ]
@@ -856,7 +899,11 @@ class PostProcessor:
                     service_type=order.service_type,
                     order_id=order.id,
                     completion_time=completion_time.total_seconds(),
-                    charge=status_info.get('charge', 0)
+                    success=True,
+                    actual_quantity=order.total_quantity - status_info.get('remains', 0),
+                    target_quantity=order.total_quantity,
+                    service_id=order.service_id,
+                    cost=status_info.get('charge', 0)
                 )
 
         except Exception as e:

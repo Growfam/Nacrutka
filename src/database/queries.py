@@ -89,6 +89,51 @@ class Queries:
 
         return config
 
+    async def get_channel_with_full_config(self, channel_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get complete channel configuration including all related data
+
+        Returns:
+            Dict with channel, settings, reaction_services, templates
+        """
+        try:
+            # Get channel
+            channel = await self.get_channel_by_id(channel_id)
+            if not channel:
+                return None
+
+            # Get settings
+            settings = await self.get_channel_settings(channel_id)
+            if not settings:
+                logger.warning(f"No settings found for channel {channel_id}")
+                return None
+
+            # Get reaction services
+            reaction_services = await self.get_reaction_services_with_details(channel_id)
+
+            # Get templates
+            templates = await self.get_all_portion_templates(channel_id)
+
+            # Build complete config
+            config = {
+                'channel': channel,
+                'settings': settings,
+                'reaction_services': reaction_services,
+                'templates': templates,
+                'channel_id': channel_id
+            }
+
+            return config
+
+        except Exception as e:
+            logger.error(
+                f"Failed to get full channel config",
+                channel_id=channel_id,
+                error=str(e),
+                exc_info=True
+            )
+            return None
+
     async def invalidate_channel_cache(self, channel_id: int):
         """Invalidate channel configuration cache"""
         self._channel_config_cache.pop(channel_id, None)
