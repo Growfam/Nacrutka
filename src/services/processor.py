@@ -1,5 +1,6 @@
 """
 Post processing service - Universal implementation for all channels
+FIXED VERSION: Properly saves nakrutka_order_id
 """
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
@@ -172,59 +173,58 @@ class PostProcessor:
             url=post.post_url
         )
 
-        async with self.db.transaction() as conn:
-            # Mark as processing
-            await conn.execute(
-                """
-                UPDATE posts 
-                SET status = $1, processed_at = $2
-                WHERE id = $3
-                """,
-                POST_STATUS["PROCESSING"],
-                datetime.utcnow(),
-                post.id
-            )
+        # Extract configuration
+        channel = config['channel']
+        settings = config['settings']
+        reaction_services = config.get('reaction_services', [])
+        templates = config['templates']
 
-            # Extract configuration
-            channel = config['channel']
-            settings = config['settings']
-            reaction_services = config.get('reaction_services', [])
-            templates = config['templates']
+        # Validate before processing
+        errors = validate_before_processing(post, settings, templates)
+        if errors:
+            raise ValidationError(f"Validation failed: {'; '.join(errors)}")
 
-            # Validate before processing
-            errors = validate_before_processing(post, settings, templates)
-            if errors:
-                raise ValidationError(f"Validation failed: {'; '.join(errors)}")
+        # Calculate quantities with randomization
+        quantities = await self._calculate_quantities(settings)
 
-            # Calculate quantities with randomization
-            quantities = await self._calculate_quantities(settings)
+        # Log calculated quantities
+        await self.db_logger.info(
+            "Calculated quantities for post",
+            post_id=post.id,
+            channel=channel.channel_username,
+            views=quantities['views'],
+            reactions=quantities['reactions'],
+            reposts=quantities['reposts'],
+            randomized={
+                'reactions': settings.randomize_reactions,
+                'reposts': settings.randomize_reposts
+            }
+        )
 
-            # Log calculated quantities
-            await self.db_logger.info(
-                "Calculated quantities for post",
-                post_id=post.id,
-                channel=channel.channel_username,
-                views=quantities['views'],
-                reactions=quantities['reactions'],
-                reposts=quantities['reposts'],
-                randomized={
-                    'reactions': settings.randomize_reactions,
-                    'reposts': settings.randomize_reposts
-                }
-            )
+        # Ensure service cache is fresh
+        await self.queries.refresh_service_cache()
 
-            # Ensure service cache is fresh
-            await self.queries.refresh_service_cache()
+        # First, update post status to processing
+        await self.db.execute(
+            """
+            UPDATE posts 
+            SET status = $1, processed_at = $2
+            WHERE id = $3
+            """,
+            POST_STATUS["PROCESSING"],
+            datetime.utcnow(),
+            post.id
+        )
 
-            # Process each service type
-            results = await self._process_all_service_types(
-                post=post,
-                config=config,
-                quantities=quantities
-            )
+        # Process each service type - NOW WITHOUT TRANSACTION
+        results = await self._process_all_service_types(
+            post=post,
+            config=config,
+            quantities=quantities
+        )
 
-            # Update post status based on results
-            await self._update_post_status(conn, post, results)
+        # Update post status based on results
+        await self._update_final_post_status(post, results)
 
     async def _calculate_quantities(self, settings: ChannelSettings) -> Dict[str, int]:
         """Calculate quantities with randomization"""
@@ -336,7 +336,6 @@ class PostProcessor:
                 service = await self._find_best_service(service_type, quantity)
                 if not service:
                     raise Exception(f"No suitable service found for {service_type}")
-
             else:
                 service = await self.queries.get_service(service_id)
                 if not service:
@@ -344,8 +343,7 @@ class PostProcessor:
                     logger.warning(f"Service {service_id} not found, finding alternative")
                     service = await self._find_best_service(service_type, quantity)
                     if not service:
-                        raise Exception(f"Service {service_id} not found in cache for {service_type}")
-
+                        raise Exception(f"Service {service_id} not found for {service_type}")
 
             # Validate and adjust quantity
             adjusted_quantity = self._adjust_quantity_for_service(quantity, service)
@@ -378,8 +376,8 @@ class PostProcessor:
             # Save portions to database
             await self._save_portions(order_id, portions)
 
-            # Send to Nakrutka
-            nakrutka_results = await self._send_to_nakrutka(
+            # Send to Nakrutka - NOW PROPERLY
+            nakrutka_results = await self._send_to_nakrutka_with_proper_update(
                 order_id=order_id,
                 service=service,
                 link=post.post_url,
@@ -392,7 +390,7 @@ class PostProcessor:
             logger.info(
                 f"{service_type.capitalize()} order created",
                 order_id=order_id,
-                service_id=service_id,
+                service_id=service.nakrutka_id,
                 service_name=service.service_name,
                 quantity=adjusted_quantity,
                 portions=len(portions),
@@ -403,7 +401,7 @@ class PostProcessor:
             return {
                 'success': True,
                 'order_id': order_id,
-                'service_id': service_id,
+                'service_id': service.nakrutka_id,
                 'quantity': adjusted_quantity,
                 'cost': cost,
                 'portions': len(portions),
@@ -601,16 +599,17 @@ class PostProcessor:
 
         await self.queries.create_portions(db_portions)
 
-    async def _send_to_nakrutka(
+    async def _send_to_nakrutka_with_proper_update(
         self,
         order_id: int,
         service: Service,
         link: str,
         portions: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Send portions to Nakrutka API"""
+        """Send to Nakrutka and PROPERLY UPDATE database"""
         results = []
         all_success = True
+        first_nakrutka_id = None
 
         for i, portion in enumerate(portions):
             try:
@@ -623,7 +622,16 @@ class PostProcessor:
                 if not validation['valid']:
                     raise ValidationError(validation.get('error', 'Invalid parameters'))
 
-                # Create order
+                # Create order in Nakrutka
+                logger.info(
+                    f"Sending to Nakrutka API",
+                    service_id=service.nakrutka_id,
+                    link=link,
+                    quantity=portion['quantity_per_run'],
+                    runs=portion['runs'],
+                    interval=portion['interval_minutes']
+                )
+
                 result = await self.nakrutka.create_order(
                     service_id=service.nakrutka_id,
                     link=link,
@@ -632,6 +640,17 @@ class PostProcessor:
                     interval=portion['interval_minutes']
                 )
 
+                # CRITICAL: Log the response
+                logger.info(f"Nakrutka API response: {result}")
+
+                nakrutka_order_id = result.get('order')
+                if not nakrutka_order_id:
+                    raise Exception(f"No order ID in Nakrutka response: {result}")
+
+                # Save first ID for main order
+                if i == 0:
+                    first_nakrutka_id = nakrutka_order_id
+
                 # Update portion with Nakrutka ID
                 await self.db.execute(
                     """
@@ -639,33 +658,33 @@ class PostProcessor:
                     SET nakrutka_portion_id = $1, status = $2, started_at = $3
                     WHERE order_id = $4 AND portion_number = $5
                     """,
-                    result.get('order'),
+                    nakrutka_order_id,
                     PORTION_STATUS["RUNNING"],
                     datetime.utcnow(),
                     order_id,
                     portion['portion_number']
                 )
 
+                logger.info(
+                    f"Updated portion {portion['portion_number']}",
+                    nakrutka_id=nakrutka_order_id,
+                    order_id=order_id
+                )
+
                 results.append({
                     'portion_number': portion['portion_number'],
-                    'order_id': result.get('order'),
+                    'order_id': nakrutka_order_id,
                     'success': True,
                     'charge': result.get('charge')
                 })
-
-                # Update main order with first Nakrutka ID
-                if i == 0:
-                    await self.queries.update_order_nakrutka_id(
-                        order_id,
-                        result.get('order')
-                    )
 
             except Exception as e:
                 logger.error(
                     f"Failed to create portion {portion['portion_number']}",
                     error=str(e),
                     order_id=order_id,
-                    service_id=service.nakrutka_id
+                    service_id=service.nakrutka_id,
+                    exc_info=True
                 )
 
                 results.append({
@@ -678,21 +697,46 @@ class PostProcessor:
 
                 # Determine if we should continue
                 if ErrorRecovery.should_retry_error(e):
-                    # Temporary error, continue with other portions
                     continue
                 else:
-                    # Permanent error, stop
                     break
+
+        # CRITICAL: Update main order with first Nakrutka ID
+        if first_nakrutka_id:
+            await self.db.execute(
+                """
+                UPDATE orders 
+                SET nakrutka_order_id = $1, status = $2, started_at = $3
+                WHERE id = $4
+                """,
+                first_nakrutka_id,
+                ORDER_STATUS["IN_PROGRESS"],
+                datetime.utcnow(),
+                order_id
+            )
+
+            logger.info(
+                f"Updated main order with Nakrutka ID",
+                order_id=order_id,
+                nakrutka_id=first_nakrutka_id
+            )
+
+            # Verify update
+            verify = await self.db.fetchval(
+                "SELECT nakrutka_order_id FROM orders WHERE id = $1",
+                order_id
+            )
+            logger.info(f"Verification: order {order_id} has nakrutka_id = {verify}")
 
         return {
             'success': all_success,
             'partial_success': len([r for r in results if r['success']]) > 0,
-            'orders': results
+            'orders': results,
+            'first_nakrutka_id': first_nakrutka_id
         }
 
-    async def _update_post_status(
+    async def _update_final_post_status(
         self,
-        conn,
         post: Post,
         results: Dict[str, Any]
     ):
@@ -723,7 +767,8 @@ class PostProcessor:
                     k: {
                         'success': v.get('success', False),
                         'quantity': v.get('quantity', 0),
-                        'cost': v.get('cost', 0)
+                        'cost': v.get('cost', 0),
+                        'nakrutka_id': v.get('nakrutka_results', {}).get('first_nakrutka_id')
                     }
                     for k, v in results.items() if v
                 }
@@ -742,7 +787,7 @@ class PostProcessor:
                 }
             )
 
-        await conn.execute(
+        await self.db.execute(
             "UPDATE posts SET status = $1 WHERE id = $2",
             status,
             post.id
