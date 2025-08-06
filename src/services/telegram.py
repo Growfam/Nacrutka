@@ -281,6 +281,7 @@ class EnhancedTelegramMonitor:
         self.app.add_handler(CommandHandler("remove_channel", self.cmd_remove_channel))
         self.app.add_handler(CommandHandler("channel_info", self.cmd_channel_info))
         self.app.add_handler(CommandHandler("stop_order", self.cmd_stop_order))
+        self.app.add_handler(CommandHandler("set_old_posts", self.cmd_set_old_posts))
 
         # Telethon specific commands
         self.app.add_handler(CommandHandler("telethon_status", self.cmd_telethon_status))
@@ -432,41 +433,91 @@ class EnhancedTelegramMonitor:
                 access_type=self._channel_access.get(channel.id, 'unknown')
             )
 
-            # Get recent posts using cascade of methods
+            # Отримуємо налаштування каналу
+            settings = await self.db.fetchrow(
+                "SELECT * FROM channel_settings WHERE channel_id = $1",
+                channel.id
+            )
+
+            if not settings:
+                logger.warning(f"No settings found for channel {channel.channel_username}")
+                return 0
+
+            # Перевіряємо чи це перший запуск для каналу
+            existing_posts_count = await self.db.fetchval(
+                "SELECT COUNT(*) FROM posts WHERE channel_id = $1",
+                channel.id
+            )
+
+            is_first_run = existing_posts_count == 0
+
+            # Визначаємо скільки постів отримати
+            if is_first_run:
+                # При першому запуску обмежуємо кількість
+                posts_to_fetch = settings['process_old_posts_count'] if settings['process_old_posts_count'] > 0 else 1
+                logger.info(
+                    f"First run for {channel.channel_username}",
+                    process_old_posts=settings['process_old_posts_count'],
+                    will_fetch=posts_to_fetch
+                )
+            else:
+                # Звичайна перевірка
+                posts_to_fetch = 50
+
+            # Отримуємо пости
             recent_posts = await self.get_channel_posts_cascade(
                 channel.channel_username,
                 channel.channel_id,
-                limit=50
+                limit=posts_to_fetch
             )
 
             if not recent_posts:
                 logger.debug(f"No posts found in {channel.channel_username}")
                 return 0
 
-            # Get existing posts from DB
+            # Отримуємо існуючі пости з БД
             existing_posts = await self.queries.get_channel_posts(
                 channel.id,
                 limit=1000
             )
             existing_set = set(existing_posts)
 
-            # Find new posts
-            new_posts = [
-                post_id for post_id in recent_posts
-                if post_id not in existing_set
-            ]
+            # Фільтруємо нові пости
+            new_posts = []
+
+            if is_first_run and settings['process_old_posts_count'] == 0:
+                # Не обробляємо старі пости при першому запуску
+                logger.info(f"First run with process_old_posts_count=0, skipping all old posts")
+                return 0
+            else:
+                # Звичайна фільтрація - всі пости яких немає в БД
+                new_posts = [
+                    post_id for post_id in recent_posts
+                    if post_id not in existing_set
+                ]
 
             if not new_posts:
                 logger.debug(f"No new posts in {channel.channel_username}")
                 return 0
 
+            # При першому запуску обмежуємо кількість
+            if is_first_run and settings['process_old_posts_count'] > 0:
+                # Беремо тільки вказану кількість останніх
+                new_posts = new_posts[-settings['process_old_posts_count']:]
+                logger.info(
+                    f"First run: limiting to {len(new_posts)} most recent posts",
+                    channel=channel.channel_username,
+                    requested=settings['process_old_posts_count']
+                )
+
             logger.info(
                 f"Found {len(new_posts)} new posts in {channel.channel_username}",
                 post_ids=new_posts[:5],
+                is_first_run=is_first_run,
                 access_method=self._channel_access.get(channel.id, 'unknown')
             )
 
-            # Save new posts to database
+            # Зберігаємо нові пости в БД
             created_count = 0
             for post_id in new_posts:
                 post_url = f"https://t.me/{channel.channel_username}/{post_id}"
@@ -486,6 +537,8 @@ class EnhancedTelegramMonitor:
                     "New posts saved",
                     channel=channel.channel_username,
                     count=created_count,
+                    is_first_run=is_first_run,
+                    process_old_posts_count=settings['process_old_posts_count'] if is_first_run else None,
                     access_method=self._channel_access.get(channel.id, 'unknown'),
                     post_ids=new_posts[:10]
                 )
@@ -1405,7 +1458,7 @@ class EnhancedTelegramMonitor:
             "/channels - Список активних каналів\n"
             "/stats - Статистика по каналах\n"
             "/check_access @username - Перевірити доступ до каналу\n\n"
-            
+
             "<b>💰 Фінанси:</b>\n"
             "/balance - Баланс Nakrutka\n"
             "/costs - Витрати на накрутку\n"
@@ -1421,6 +1474,7 @@ class EnhancedTelegramMonitor:
             "/add_channel @username - Додати канал\n"
             "/remove_channel @username - Видалити канал\n"
             "/channel_info @username - Інформація про канал\n"
+            "/set_old_posts @username N - Змінити к-сть старих постів\n"
             "/stop_order <ID> - Зупинити замовлення\n\n"
             
             "<b>💡 Поради:</b>\n"
@@ -1440,12 +1494,33 @@ class EnhancedTelegramMonitor:
 
         if not context.args:
             await update.message.reply_text(
-                "❌ Вкажіть username каналу\n"
-                "Приклад: /add_channel @durov"
+                "❌ Вкажіть username каналу\n\n"
+                "Формат: /add_channel @username [кількість_старих_постів]\n\n"
+                "Приклади:\n"
+                "• /add_channel @durov - не обробляти старі пости\n"
+                "• /add_channel @durov 0 - теж не обробляти старі\n"
+                "• /add_channel @durov 5 - обробити останні 5 постів\n"
+                "• /add_channel @durov 20 - обробити останні 20 постів"
             )
             return
 
         username = context.args[0].lstrip('@').lower()
+
+        # Визначаємо кількість старих постів для обробки
+        process_old_posts = 0  # За замовчуванням - не обробляти старі
+
+        if len(context.args) > 1:
+            try:
+                process_old_posts = int(context.args[1])
+                if process_old_posts < 0:
+                    await update.message.reply_text("❌ Кількість постів не може бути від'ємною")
+                    return
+                if process_old_posts > 100:
+                    await update.message.reply_text("❌ Максимум 100 старих постів")
+                    return
+            except ValueError:
+                await update.message.reply_text("❌ Кількість постів має бути числом")
+                return
 
         # Перевіряємо чи вже є такий канал
         existing = await self.db.fetchrow(
@@ -1457,12 +1532,20 @@ class EnhancedTelegramMonitor:
             if existing['is_active']:
                 await update.message.reply_text(f"❌ Канал @{username} вже активний")
             else:
-                # Активуємо існуючий канал
+                # Активуємо існуючий канал і оновлюємо налаштування
                 await self.db.execute(
                     "UPDATE channels SET is_active = true WHERE id = $1",
                     existing['id']
                 )
-                await update.message.reply_text(f"✅ Канал @{username} активовано")
+                # Оновлюємо process_old_posts_count
+                await self.db.execute(
+                    "UPDATE channel_settings SET process_old_posts_count = $1 WHERE channel_id = $2",
+                    process_old_posts, existing['id']
+                )
+                await update.message.reply_text(
+                    f"✅ Канал @{username} активовано\n"
+                    f"Старі пости: {process_old_posts if process_old_posts > 0 else 'не обробляти'}"
+                )
             return
 
         # Перевіряємо доступ до каналу
@@ -1494,22 +1577,21 @@ class EnhancedTelegramMonitor:
 
             # Створюємо канал
             new_channel_id = await self.db.fetchval("""
-                INSERT INTO channels (channel_username, channel_id, is_active)
-                VALUES ($1, $2, true)
-                RETURNING id
-            """, username, channel_id)
+                                                    INSERT INTO channels (channel_username, channel_id, is_active)
+                                                    VALUES ($1, $2, true) RETURNING id
+                                                    """, username, channel_id)
 
-            # Створюємо налаштування за замовчуванням
+            # Створюємо налаштування з вказаною кількістю старих постів
             await self.db.execute("""
-                INSERT INTO channel_settings (
-                    channel_id, 
-                    views_target, 
-                    reactions_target, 
-                    reposts_target,
-                    randomize_percent
-                )
-                VALUES ($1, 1000, 50, 20, 30)
-            """, new_channel_id)
+                                  INSERT INTO channel_settings (channel_id,
+                                                                views_target,
+                                                                reactions_target,
+                                                                reposts_target,
+                                                                randomize_percent,
+                                                                process_old_posts_count,
+                                                                max_post_age_hours)
+                                  VALUES ($1, 1000, 50, 20, 30, $2, 24)
+                                  """, new_channel_id, process_old_posts)
 
             success_msg = f"✅ Канал @{username} додано!\n"
             if channel_title:
@@ -1517,7 +1599,9 @@ class EnhancedTelegramMonitor:
             if channel_id:
                 success_msg += f"ID: {channel_id}\n"
             success_msg += "\nНалаштування за замовчуванням:\n"
-            success_msg += "👁 1000 | ❤️ 50 | 🔄 20 | 🎲 ±30%"
+            success_msg += "👁 1000 | ❤️ 50 | 🔄 20 | 🎲 ±30%\n\n"
+            success_msg += f"📝 Старі пости: {process_old_posts if process_old_posts > 0 else 'не обробляти'}\n"
+            success_msg += f"⏰ Макс. вік поста: 24 години"
 
             await msg.edit_text(success_msg)
 
@@ -1526,6 +1610,7 @@ class EnhancedTelegramMonitor:
                 "Channel added",
                 channel=username,
                 channel_id=channel_id,
+                process_old_posts=process_old_posts,
                 added_by=update.effective_user.id
             )
 
@@ -1668,6 +1753,48 @@ class EnhancedTelegramMonitor:
                 message += f"{status_emoji} /{post['post_id']} - {post['created_at'].strftime('%H:%M')}\n"
 
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    async def cmd_set_old_posts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Змінити налаштування обробки старих постів для каналу"""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Unauthorized")
+            return
+
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Вкажіть канал і кількість\n\n"
+                "Формат: /set_old_posts @username кількість\n\n"
+                "Приклад: /set_old_posts @durov 0"
+            )
+            return
+
+        username = context.args[0].lstrip('@').lower()
+
+        try:
+            count = int(context.args[1])
+            if count < 0 or count > 100:
+                await update.message.reply_text("❌ Кількість має бути від 0 до 100")
+                return
+        except ValueError:
+            await update.message.reply_text("❌ Кількість має бути числом")
+            return
+
+        # Оновлюємо налаштування
+        result = await self.db.execute("""
+                                       UPDATE channel_settings
+                                       SET process_old_posts_count = $1
+                                       WHERE channel_id = (SELECT id
+                                                           FROM channels
+                                                           WHERE channel_username = $2)
+                                       """, count, username)
+
+        if result == "UPDATE 1":
+            await update.message.reply_text(
+                f"✅ Оновлено налаштування для @{username}\n"
+                f"Старі пости: {count if count > 0 else 'не обробляти'}"
+            )
+        else:
+            await update.message.reply_text(f"❌ Канал @{username} не знайдено")
 
     async def cmd_stop_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stop_order command - зупинити замовлення"""

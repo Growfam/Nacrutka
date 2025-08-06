@@ -84,6 +84,8 @@ class ChannelSettings:
     randomize_reactions: bool = True
     randomize_reposts: bool = True
     randomize_percent: int = 40
+    process_old_posts_count: int = 0
+    max_post_age_hours: int = 24
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
     # Additional fields for enhanced functionality
