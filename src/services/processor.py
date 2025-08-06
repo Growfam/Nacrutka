@@ -339,7 +339,7 @@ class PostProcessor:
                     logger.warning(f"Service {service_id} not found, finding alternative")
                     service = await self._find_best_service(service_type, quantity)
                     if not service:
-                        raise Exception(f"No service available for {service_type}")
+                        raise Exception(f"Service {service_id} not found in cache for {service_type}")
                     service_id = service.nakrutka_id
 
             # Validate and adjust quantity
