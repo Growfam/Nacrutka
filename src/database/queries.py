@@ -527,12 +527,10 @@ class Queries:
             return
 
         query = """
-            INSERT INTO order_portions (
-                order_id, portion_number, quantity_per_run, 
-                runs, interval_minutes, status, scheduled_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """
+                INSERT INTO order_portions (order_id, portion_number, quantity_per_run, \
+                                            runs, interval_minutes, status, scheduled_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                """
 
         # Prepare data for bulk insert
         data = [
@@ -548,8 +546,9 @@ class Queries:
             for p in portions
         ]
 
-        # Bulk insert
-        await self.db.executemany(query, data)
+        # Insert each portion
+        for portion_data in data:
+            await self.db.execute(query, *portion_data)
 
     async def create_portions_batch(self, order_id: int, portions: List[Dict[str, Any]]):
         """Create portions for a single order"""
