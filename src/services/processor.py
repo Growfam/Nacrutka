@@ -600,11 +600,11 @@ class PostProcessor:
         await self.queries.create_portions(db_portions)
 
     async def _send_to_nakrutka_with_proper_update(
-        self,
-        order_id: int,
-        service: Service,
-        link: str,
-        portions: List[Dict[str, Any]]
+            self,
+            order_id: int,
+            service: Service,
+            link: str,
+            portions: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Send to Nakrutka and PROPERLY UPDATE database"""
         results = []
@@ -643,32 +643,49 @@ class PostProcessor:
                 # CRITICAL: Log the response
                 logger.info(f"Nakrutka API response: {result}")
 
-                nakrutka_order_id = result.get('order')
-                if not nakrutka_order_id:
+                nakrutka_order_id = str(result.get('order'))  # Конвертуємо в string
+                if not nakrutka_order_id or nakrutka_order_id == 'None':
+                    logger.error(f"No order ID in response: {result}")
                     raise Exception(f"No order ID in Nakrutka response: {result}")
 
                 # Save first ID for main order
                 if i == 0:
                     first_nakrutka_id = nakrutka_order_id
 
+                    # ОНОВЛЮЄМО ОДРАЗУ! Не чекаємо кінця циклу
+                    try:
+                        await self.db.execute(
+                            """
+                            UPDATE orders
+                            SET nakrutka_order_id = $1,
+                                status            = $2,
+                                started_at        = $3
+                            WHERE id = $4
+                            """,
+                            first_nakrutka_id,
+                            ORDER_STATUS["IN_PROGRESS"],
+                            datetime.utcnow(),
+                            order_id
+                        )
+                        logger.info(f"IMMEDIATELY updated order {order_id} with nakrutka_id {first_nakrutka_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to update order: {e}")
+
                 # Update portion with Nakrutka ID
                 await self.db.execute(
                     """
-                    UPDATE order_portions 
-                    SET nakrutka_portion_id = $1, status = $2, started_at = $3
-                    WHERE order_id = $4 AND portion_number = $5
+                    UPDATE order_portions
+                    SET nakrutka_portion_id = $1,
+                        status              = $2,
+                        started_at          = $3
+                    WHERE order_id = $4
+                      AND portion_number = $5
                     """,
                     nakrutka_order_id,
                     PORTION_STATUS["RUNNING"],
                     datetime.utcnow(),
                     order_id,
                     portion['portion_number']
-                )
-
-                logger.info(
-                    f"Updated portion {portion['portion_number']}",
-                    nakrutka_id=nakrutka_order_id,
-                    order_id=order_id
                 )
 
                 results.append({
@@ -695,38 +712,8 @@ class PostProcessor:
 
                 all_success = False
 
-                # Determine if we should continue
-                if ErrorRecovery.should_retry_error(e):
-                    continue
-                else:
-                    break
-
-        # CRITICAL: Update main order with first Nakrutka ID
-        if first_nakrutka_id:
-            await self.db.execute(
-                """
-                UPDATE orders 
-                SET nakrutka_order_id = $1, status = $2, started_at = $3
-                WHERE id = $4
-                """,
-                first_nakrutka_id,
-                ORDER_STATUS["IN_PROGRESS"],
-                datetime.utcnow(),
-                order_id
-            )
-
-            logger.info(
-                f"Updated main order with Nakrutka ID",
-                order_id=order_id,
-                nakrutka_id=first_nakrutka_id
-            )
-
-            # Verify update
-            verify = await self.db.fetchval(
-                "SELECT nakrutka_order_id FROM orders WHERE id = $1",
-                order_id
-            )
-            logger.info(f"Verification: order {order_id} has nakrutka_id = {verify}")
+                # Продовжуємо з наступними portions
+                continue
 
         return {
             'success': all_success,
