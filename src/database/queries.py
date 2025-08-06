@@ -426,8 +426,8 @@ class Queries:
 
         return order_id
 
-    async def update_order_nakrutka_id(self, order_id: int, nakrutka_id: str):
-        """Update order with Nakrutka order ID"""
+    async def update_order_nakrutka_id(self, order_id: int, nakrutka_id: str) -> bool:
+        """Update order with Nakrutka order ID and return success status"""
         query = """
             UPDATE orders 
             SET nakrutka_order_id = $1,
@@ -435,13 +435,35 @@ class Queries:
                 started_at = $3
             WHERE id = $4
         """
-        await self.db.execute(
+        result = await self.db.execute(
             query,
             nakrutka_id,
             ORDER_STATUS["IN_PROGRESS"],
             datetime.utcnow(),
             order_id
         )
+
+        # Check if update was successful
+        success = result == "UPDATE 1"
+
+        if success:
+            logger.info(f"Successfully updated order {order_id} with nakrutka_id {nakrutka_id}")
+        else:
+            logger.error(f"Failed to update order {order_id} with nakrutka_id {nakrutka_id}, result: {result}")
+
+        return success
+
+    async def verify_order_update(self, order_id: int) -> Optional[str]:
+        """Verify order was updated with nakrutka_order_id"""
+        query = "SELECT nakrutka_order_id FROM orders WHERE id = $1"
+        nakrutka_id = await self.db.fetchval(query, order_id)
+
+        if nakrutka_id:
+            logger.info(f"Order {order_id} verified with nakrutka_id: {nakrutka_id}")
+        else:
+            logger.error(f"Order {order_id} has NULL nakrutka_order_id!")
+
+        return nakrutka_id
 
     async def get_active_orders(self) -> List[Order]:
         """Get orders in progress"""
@@ -598,6 +620,31 @@ class Queries:
             else:
                 query = "UPDATE order_portions SET status = $1 WHERE id = $2"
                 await self.db.execute(query, status, portion_id)
+
+    async def update_all_portions_for_order(
+        self,
+        order_id: int,
+        status: str,
+        nakrutka_id: str
+    ):
+        """Update all portions for an order with same nakrutka_id"""
+        query = """
+            UPDATE order_portions 
+            SET status = $1, 
+                nakrutka_portion_id = $2, 
+                started_at = $3
+            WHERE order_id = $4
+        """
+        result = await self.db.execute(
+            query,
+            status,
+            nakrutka_id,
+            datetime.utcnow(),
+            order_id
+        )
+
+        logger.info(f"Updated portions for order {order_id}: {result}")
+        return result
 
     async def get_scheduled_portions(self) -> List[OrderPortion]:
         """Get portions ready to be executed"""
