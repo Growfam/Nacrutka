@@ -664,13 +664,28 @@ class Queries:
         return self._service_cache.services
 
     async def get_service(self, service_id: int) -> Optional[Service]:
-        """Get service by Nakrutka ID with caching"""
-        # Try cache first
+        """Get service by ID (works with both id and nakrutka_id)"""
+        # Спочатку шукаємо в кеші
         service = self._service_cache.get_service(service_id)
         if service:
             return service
 
-        # Refresh cache and try again
+        # Якщо не знайшли - шукаємо в БД
+        query = """
+                SELECT * \
+                FROM services
+                WHERE id = $1 \
+                   OR nakrutka_id = $1 LIMIT 1 \
+                """
+        row = await self.db.fetchrow(query, service_id)
+
+        if row:
+            service = Service.from_db_row(dict(row))
+            # Додаємо в кеш
+            self._service_cache.add_service(service)
+            return service
+
+        # Оновлюємо кеш і пробуємо ще раз
         await self.refresh_service_cache()
         return self._service_cache.get_service(service_id)
 

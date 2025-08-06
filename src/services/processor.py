@@ -83,6 +83,11 @@ class PostProcessor:
         """Process all posts with 'new' status"""
         async with self._processing_lock:
             try:
+                # Ensure service cache is populated
+                if not self.queries._service_cache.services:
+                    logger.info("Service cache empty, refreshing...")
+                    await self.queries.refresh_service_cache()
+
                 # Get new posts
                 new_posts = await self.queries.get_new_posts(limit=10)
 
@@ -331,7 +336,7 @@ class PostProcessor:
                 service = await self._find_best_service(service_type, quantity)
                 if not service:
                     raise Exception(f"No suitable service found for {service_type}")
-                service_id = service.nakrutka_id
+
             else:
                 service = await self.queries.get_service(service_id)
                 if not service:
@@ -340,7 +345,7 @@ class PostProcessor:
                     service = await self._find_best_service(service_type, quantity)
                     if not service:
                         raise Exception(f"Service {service_id} not found in cache for {service_type}")
-                    service_id = service.nakrutka_id
+
 
             # Validate and adjust quantity
             adjusted_quantity = self._adjust_quantity_for_service(quantity, service)
@@ -357,7 +362,7 @@ class PostProcessor:
             order_id = await self.queries.create_order(
                 post_id=post.id,
                 service_type=service_type,
-                service_id=service_id,
+                service_id=service.nakrutka_id,
                 total_quantity=adjusted_quantity,
                 start_delay_minutes=delay_minutes
             )
