@@ -29,6 +29,8 @@ class PostProcessor(LoggerMixin):
         self.processing_lock = asyncio.Lock()
         self.processed_count = 0
         self.error_count = 0
+        # ДОДАНО: Кеш для запобігання паралельній обробці
+        self.processing_posts = set()
 
     async def process_new_posts(self, limit: int = 10) -> int:
         """Process batch of new posts"""
@@ -46,10 +48,22 @@ class PostProcessor(LoggerMixin):
                 # Process each post
                 processed = 0
                 for post in posts:
+                    # ДОДАНО: Перевірка чи вже обробляється
+                    if post.id in self.processing_posts:
+                        self.log_warning(
+                            f"Post {post.id} already being processed, skipping",
+                            post_id=post.id
+                        )
+                        continue
+
                     try:
+                        # Додаємо в список обробки
+                        self.processing_posts.add(post.id)
+
                         await self._process_single_post(post)
                         processed += 1
                         self.processed_count += 1
+
                     except Exception as e:
                         self.log_error(
                             "Failed to process post",
@@ -60,6 +74,9 @@ class PostProcessor(LoggerMixin):
                         await post_repo.update_status(post.id, PostStatus.FAILED)
                         self.error_count += 1
                         metrics.log_error_rate("post_processing", 1)
+                    finally:
+                        # Видаляємо з списку обробки
+                        self.processing_posts.discard(post.id)
 
                 self.log_info(
                     "Batch processing completed",
@@ -76,6 +93,20 @@ class PostProcessor(LoggerMixin):
 
     async def _process_single_post(self, post: Post):
         """Process single post"""
+
+        # ВАЖЛИВО: ПЕРЕВІРКА НА ІСНУЮЧІ ЗАМОВЛЕННЯ
+        existing_orders = await order_repo.get_orders_by_post(post.id)
+        if existing_orders:
+            self.log_warning(
+                f"Orders already exist for post {post.id}, marking as completed",
+                post_id=post.id,
+                existing_count=len(existing_orders),
+                existing_types=[o.service_type for o in existing_orders]
+            )
+            # Помічаємо як completed якщо вже є замовлення
+            await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
+            return
+
         self.log_info(
             "Processing post",
             post_id=post.id,
@@ -98,11 +129,28 @@ class PostProcessor(LoggerMixin):
             await channel_repo.bulk_create_default_settings(post.channel_id)
             all_settings = await channel_repo.get_channel_settings(post.channel_id)
 
+        # ДОДАНО: Отримуємо інформацію про канал для username
+        channel = await channel_repo.get_channel(post.channel_id)
+        if channel and channel.username:
+            post.channel_username = channel.username
+
         # Create orders for each service type
         orders_created = []
+        failed_services = []
 
         for settings in all_settings:
             try:
+                # ДОДАНО: Перевірка чи вже існують замовлення цього типу
+                existing_type_orders = [o for o in existing_orders if o.service_type == settings.service_type]
+                if existing_type_orders:
+                    self.log_warning(
+                        f"Orders of type {settings.service_type} already exist for post {post.id}",
+                        post_id=post.id,
+                        service_type=settings.service_type,
+                        count=len(existing_type_orders)
+                    )
+                    continue
+
                 if settings.service_type == ServiceType.VIEWS:
                     orders = await self._create_view_orders(post, settings)
                     orders_created.extend(orders)
@@ -122,6 +170,7 @@ class PostProcessor(LoggerMixin):
                     post_id=post.id,
                     service_type=settings.service_type
                 )
+                failed_services.append(settings.service_type)
 
         # Update post status
         if orders_created:
@@ -129,14 +178,24 @@ class PostProcessor(LoggerMixin):
             self.log_info(
                 "Post processed successfully",
                 post_id=post.id,
-                orders_created=len(orders_created)
+                orders_created=len(orders_created),
+                order_types=[o.service_type for o in orders_created]
             )
         else:
-            await post_repo.update_status(post.id, PostStatus.FAILED)
-            self.log_error(
-                "No orders created for post",
-                post_id=post.id
-            )
+            # Якщо не створено жодного замовлення але вже є старі - все одно completed
+            if existing_orders:
+                await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
+                self.log_info(
+                    "Post already has orders, marked as completed",
+                    post_id=post.id
+                )
+            else:
+                await post_repo.update_status(post.id, PostStatus.FAILED)
+                self.log_error(
+                    "No orders created for post",
+                    post_id=post.id,
+                    failed_services=failed_services
+                )
 
     async def _create_view_orders(
             self,
@@ -144,6 +203,12 @@ class PostProcessor(LoggerMixin):
             settings: ChannelSettings
     ) -> List[Order]:
         """Create orders for views"""
+
+        # ДОДАНО: Додаткова перевірка на дублікати
+        existing_views = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.VIEWS)
+        if existing_views:
+            self.log_warning(f"View orders already exist for post {post.id}")
+            return []
 
         # Спочатку перевіряємо збережені service_ids
         service_ids = settings.twiboost_service_ids or {}
@@ -210,7 +275,8 @@ class PostProcessor(LoggerMixin):
                 order_id=order.id,
                 portion=portion.number,
                 quantity=portion.quantity,
-                scheduled_at=portion.scheduled_at
+                scheduled_at=portion.scheduled_at,
+                link=post.link  # Логуємо посилання
             )
 
         return orders
@@ -221,6 +287,12 @@ class PostProcessor(LoggerMixin):
             settings: ChannelSettings
     ) -> List[Order]:
         """Create orders for reactions"""
+
+        # ДОДАНО: Перевірка на дублікати
+        existing_reactions = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REACTIONS)
+        if existing_reactions:
+            self.log_warning(f"Reaction orders already exist for post {post.id}")
+            return []
 
         if not settings.reaction_distribution:
             self.log_warning("No reaction distribution configured")
@@ -249,6 +321,12 @@ class PostProcessor(LoggerMixin):
         # Create order for each reaction type
         orders = []
         for emoji, quantity in reaction_quantities.items():
+            # ДОДАНО: Перевірка чи вже є замовлення для цієї реакції
+            existing_emoji_order = await order_repo.check_emoji_order_exists(post.id, emoji)
+            if existing_emoji_order:
+                self.log_warning(f"Order for reaction {emoji} already exists for post {post.id}")
+                continue
+
             # Find service ID for this reaction
             service_key = f"reaction_{emoji}"
             service_id = reaction_mapping.get(service_key)
@@ -290,7 +368,8 @@ class PostProcessor(LoggerMixin):
                 quantity=quantity,
                 runs=runs,
                 interval=settings.run_interval,
-                service_id=service_id
+                service_id=service_id,
+                link=post.link
             )
 
         return orders
@@ -301,6 +380,12 @@ class PostProcessor(LoggerMixin):
             settings: ChannelSettings
     ) -> List[Order]:
         """Create orders for reposts"""
+
+        # ДОДАНО: Перевірка на дублікати
+        existing_reposts = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REPOSTS)
+        if existing_reposts:
+            self.log_warning(f"Repost orders already exist for post {post.id}")
+            return []
 
         # Спочатку перевіряємо збережені service_ids
         service_ids = settings.twiboost_service_ids or {}
@@ -375,7 +460,8 @@ class PostProcessor(LoggerMixin):
             quantity=portion.quantity,
             runs=runs,
             scheduled_at=portion.scheduled_at,
-            service_id=service_id
+            service_id=service_id,
+            link=post.link
         )
 
         return [order]
@@ -390,7 +476,8 @@ class PostProcessor(LoggerMixin):
             "error_rate": (
                 self.error_count / self.processed_count * 100
                 if self.processed_count > 0 else 0
-            )
+            ),
+            "currently_processing": len(self.processing_posts)
         })
 
         return stats
@@ -408,11 +495,22 @@ class PostProcessor(LoggerMixin):
 
         self.log_info(f"Reprocessing {len(failed_posts)} failed posts")
 
-        # Reset status to NEW and process again
+        # ДОДАНО: Перевірка чи мають failed posts вже замовлення
+        reprocess_count = 0
         for post in failed_posts:
-            await post_repo.update_status(post.id, PostStatus.NEW)
+            existing_orders = await order_repo.get_orders_by_post(post.id)
+            if existing_orders:
+                # Якщо є замовлення - просто міняємо статус на completed
+                await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
+                self.log_info(f"Post {post.id} has orders, marking as completed")
+            else:
+                # Якщо немає - повертаємо на обробку
+                await post_repo.update_status(post.id, PostStatus.NEW)
+                reprocess_count += 1
 
-        return await self.process_new_posts(limit)
+        if reprocess_count > 0:
+            return await self.process_new_posts(reprocess_count)
+        return 0
 
 
 # Global processor instance

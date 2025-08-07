@@ -18,14 +18,14 @@ class ChannelRepository(LoggerMixin):
     async def create_channel(self, channel_data: Dict[str, Any]) -> Channel:
         """Create new channel"""
         query = """
-                INSERT INTO channels (id, username, title, is_active, monitoring_interval)
-                VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO \
-                UPDATE SET
-                    username = EXCLUDED.username, \
-                    title = EXCLUDED.title, \
-                    updated_at = NOW() \
-                    RETURNING * \
-                """
+            INSERT INTO channels (id, username, title, is_active, monitoring_interval)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (id) DO UPDATE SET
+                username = EXCLUDED.username,
+                title = EXCLUDED.title,
+                updated_at = NOW()
+            RETURNING *
+        """
 
         row = await db.fetchrow(
             query,
@@ -48,14 +48,31 @@ class ChannelRepository(LoggerMixin):
             return self._row_to_channel(row)
         return None
 
+    async def get_channel_with_username(self, channel_id: int) -> Optional[Channel]:
+        """Get channel ensuring username is loaded"""
+        channel = await self.get_channel(channel_id)
+
+        if channel and not channel.username:
+            # Try to get username from Telegram
+            try:
+                from src.bot.telegram_monitor import telegram_monitor
+                if telegram_monitor:
+                    info = await telegram_monitor.get_channel_info(channel_id)
+                    if info and info.get("username"):
+                        await self.update_channel_username(channel_id, info["username"])
+                        channel.username = info["username"]
+            except Exception as e:
+                self.log_error(f"Failed to get channel username: {e}")
+
+        return channel
+
     async def get_active_channels(self) -> List[Channel]:
         """Get all active channels"""
         query = """
-                SELECT * \
-                FROM channels
-                WHERE is_active = true
-                ORDER BY created_at DESC \
-                """
+            SELECT * FROM channels
+            WHERE is_active = true
+            ORDER BY created_at DESC
+        """
         rows = await db.fetch(query)
 
         channels = [self._row_to_channel(row) for row in rows]
@@ -65,13 +82,12 @@ class ChannelRepository(LoggerMixin):
     async def get_channels_to_check(self) -> List[Channel]:
         """Get channels that need checking"""
         query = """
-                SELECT * \
-                FROM channels
-                WHERE is_active = true
-                  AND (last_check_at IS NULL
-                    OR last_check_at < NOW() - INTERVAL '1 second' * monitoring_interval)
-                ORDER BY last_check_at ASC NULLS FIRST \
-                """
+            SELECT * FROM channels
+            WHERE is_active = true
+              AND (last_check_at IS NULL
+                OR last_check_at < NOW() - INTERVAL '1 second' * monitoring_interval)
+            ORDER BY last_check_at ASC NULLS FIRST
+        """
         rows = await db.fetch(query)
 
         channels = [self._row_to_channel(row) for row in rows]
@@ -81,23 +97,70 @@ class ChannelRepository(LoggerMixin):
     async def update_last_check(self, channel_id: int):
         """Update last check timestamp"""
         query = """
-                UPDATE channels
-                SET last_check_at = NOW()
-                WHERE id = $1 \
-                """
+            UPDATE channels
+            SET last_check_at = NOW()
+            WHERE id = $1
+        """
         await db.execute(query, channel_id)
 
     async def update_channel_status(self, channel_id: int, is_active: bool):
         """Update channel active status"""
         query = """
-                UPDATE channels
-                SET is_active  = $2, \
-                    updated_at = NOW()
-                WHERE id = $1 \
-                """
+            UPDATE channels
+            SET is_active = $2,
+                updated_at = NOW()
+            WHERE id = $1
+        """
         await db.execute(query, channel_id, is_active)
 
         self.log_info("Channel status updated", channel_id=channel_id, is_active=is_active)
+
+    async def update_channel_username(self, channel_id: int, username: str):
+        """Update channel username"""
+        query = """
+            UPDATE channels
+            SET username = $2,
+                updated_at = NOW()
+            WHERE id = $1
+        """
+        await db.execute(query, channel_id, username)
+
+        # Also update username in posts for correct links
+        query_posts = """
+            UPDATE posts
+            SET channel_username = $2
+            WHERE channel_id = $1
+        """
+        await db.execute(query_posts, channel_id, username)
+
+        self.log_info(
+            "Channel username updated",
+            channel_id=channel_id,
+            username=username
+        )
+
+    async def ensure_all_usernames(self):
+        """Ensure all channels have usernames where possible"""
+        channels = await self.get_active_channels()
+        updated = 0
+
+        for channel in channels:
+            if not channel.username:
+                try:
+                    from src.bot.telegram_monitor import telegram_monitor
+                    if telegram_monitor:
+                        info = await telegram_monitor.get_channel_info(channel.id)
+                        if info and info.get("username"):
+                            await self.update_channel_username(channel.id, info["username"])
+                            updated += 1
+                            self.log_info(
+                                f"Username updated for channel {channel.id}: {info['username']}"
+                            )
+                except Exception as e:
+                    self.log_error(f"Failed to update username for {channel.id}: {e}")
+
+        self.log_info(f"Updated usernames for {updated} channels")
+        return updated
 
     async def delete_channel(self, channel_id: int):
         """Delete channel and all related data"""
@@ -111,25 +174,27 @@ class ChannelRepository(LoggerMixin):
     async def create_settings(self, settings_data: Dict[str, Any]) -> ChannelSettings:
         """Create or update channel settings"""
         query = """
-                INSERT INTO channel_settings (channel_id, service_type, base_quantity, randomization_percent, \
-                                              is_enabled, portions_count, fast_delivery_percent, \
-                                              reaction_distribution, repost_delay_minutes, \
-                                              drops_per_run, run_interval, twiboost_service_ids) \
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (channel_id, service_type) DO \
-                UPDATE SET
-                    base_quantity = EXCLUDED.base_quantity, \
-                    randomization_percent = EXCLUDED.randomization_percent, \
-                    is_enabled = EXCLUDED.is_enabled, \
-                    portions_count = EXCLUDED.portions_count, \
-                    fast_delivery_percent = EXCLUDED.fast_delivery_percent, \
-                    reaction_distribution = EXCLUDED.reaction_distribution, \
-                    repost_delay_minutes = EXCLUDED.repost_delay_minutes, \
-                    drops_per_run = EXCLUDED.drops_per_run, \
-                    run_interval = EXCLUDED.run_interval, \
-                    twiboost_service_ids = EXCLUDED.twiboost_service_ids, \
-                    updated_at = NOW() \
-                    RETURNING * \
-                """
+            INSERT INTO channel_settings (
+                channel_id, service_type, base_quantity, randomization_percent,
+                is_enabled, portions_count, fast_delivery_percent,
+                reaction_distribution, repost_delay_minutes,
+                drops_per_run, run_interval, twiboost_service_ids
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (channel_id, service_type) DO UPDATE SET
+                base_quantity = EXCLUDED.base_quantity,
+                randomization_percent = EXCLUDED.randomization_percent,
+                is_enabled = EXCLUDED.is_enabled,
+                portions_count = EXCLUDED.portions_count,
+                fast_delivery_percent = EXCLUDED.fast_delivery_percent,
+                reaction_distribution = EXCLUDED.reaction_distribution,
+                repost_delay_minutes = EXCLUDED.repost_delay_minutes,
+                drops_per_run = EXCLUDED.drops_per_run,
+                run_interval = EXCLUDED.run_interval,
+                twiboost_service_ids = EXCLUDED.twiboost_service_ids,
+                updated_at = NOW()
+            RETURNING *
+        """
 
         # Convert dicts to JSON
         reaction_dist = json.dumps(settings_data.get("reaction_distribution")) if settings_data.get(
@@ -169,21 +234,19 @@ class ChannelRepository(LoggerMixin):
         """Get channel settings"""
         if service_type:
             query = """
-                    SELECT * \
-                    FROM channel_settings
-                    WHERE channel_id = $1 \
-                      AND service_type = $2 \
-                      AND is_enabled = true \
-                    """
+                SELECT * FROM channel_settings
+                WHERE channel_id = $1
+                  AND service_type = $2
+                  AND is_enabled = true
+            """
             rows = await db.fetch(query, channel_id, service_type)
         else:
             query = """
-                    SELECT * \
-                    FROM channel_settings
-                    WHERE channel_id = $1 \
-                      AND is_enabled = true
-                    ORDER BY service_type \
-                    """
+                SELECT * FROM channel_settings
+                WHERE channel_id = $1
+                  AND is_enabled = true
+                ORDER BY service_type
+            """
             rows = await db.fetch(query, channel_id)
 
         return [self._row_to_settings(row) for row in rows]
@@ -191,13 +254,13 @@ class ChannelRepository(LoggerMixin):
     async def get_all_settings(self) -> List[ChannelSettings]:
         """Get all channel settings"""
         query = """
-                SELECT cs.*
-                FROM channel_settings cs
-                         JOIN channels c ON cs.channel_id = c.id
-                WHERE cs.is_enabled = true \
-                  AND c.is_active = true
-                ORDER BY cs.channel_id, cs.service_type \
-                """
+            SELECT cs.*
+            FROM channel_settings cs
+            JOIN channels c ON cs.channel_id = c.id
+            WHERE cs.is_enabled = true
+              AND c.is_active = true
+            ORDER BY cs.channel_id, cs.service_type
+        """
         rows = await db.fetch(query)
 
         return [self._row_to_settings(row) for row in rows]
@@ -210,12 +273,12 @@ class ChannelRepository(LoggerMixin):
     ):
         """Update Twiboost service IDs for channel"""
         query = """
-                UPDATE channel_settings
-                SET twiboost_service_ids = $3, \
-                    updated_at           = NOW()
-                WHERE channel_id = $1 \
-                  AND service_type = $2 \
-                """
+            UPDATE channel_settings
+            SET twiboost_service_ids = $3,
+                updated_at = NOW()
+            WHERE channel_id = $1
+              AND service_type = $2
+        """
 
         await db.execute(query, channel_id, service_type, json.dumps(service_ids))
 

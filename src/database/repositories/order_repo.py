@@ -16,13 +16,32 @@ class OrderRepository(LoggerMixin):
     """Repository for order operations"""
 
     async def create_order(self, order_data: Dict[str, Any]) -> Order:
-        """Create new order"""
+        """Create new order with duplicate check"""
+        # ДОДАНО: Check for duplicates first
+        if order_data.get("service_type") == ServiceType.REACTIONS and order_data.get("reaction_emoji"):
+            exists = await self.check_emoji_order_exists(
+                order_data["post_id"],
+                order_data["reaction_emoji"]
+            )
+            if exists:
+                self.log_warning(
+                    "Duplicate reaction order prevented",
+                    post_id=order_data["post_id"],
+                    emoji=order_data["reaction_emoji"]
+                )
+                return None
+
+        # ОНОВЛЕНО: Added ON CONFLICT handling
         query = """
-                INSERT INTO orders (post_id, twiboost_order_id, service_type, service_id, \
-                                    quantity, actual_quantity, portion_number, portion_size, \
-                                    runs, interval, reaction_emoji, status, scheduled_at) \
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING * \
-                """
+            INSERT INTO orders (
+                post_id, twiboost_order_id, service_type, service_id,
+                quantity, actual_quantity, portion_number, portion_size,
+                runs, interval, reaction_emoji, status, scheduled_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT DO NOTHING
+            RETURNING *
+        """
 
         row = await db.fetchrow(
             query,
@@ -41,7 +60,21 @@ class OrderRepository(LoggerMixin):
             order_data.get("scheduled_at")
         )
 
+        if not row:
+            self.log_warning(
+                "Order creation skipped (duplicate)",
+                post_id=order_data["post_id"],
+                service_type=order_data["service_type"]
+            )
+            return None
+
         order = self._row_to_order(row)
+
+        # ДОДАНО: Mark post as having orders
+        await db.execute(
+            "UPDATE posts SET orders_created = TRUE WHERE id = $1",
+            order_data["post_id"]
+        )
 
         self.log_info(
             "Order created",
@@ -69,16 +102,17 @@ class OrderRepository(LoggerMixin):
         return None
 
     async def get_pending_orders(self, limit: int = 10) -> List[Order]:
-        """Get pending orders ready for execution"""
+        """Get pending orders ready for execution with locking"""
+        # ОНОВЛЕНО: Using FOR UPDATE SKIP LOCKED to prevent duplicates
         query = """
-                SELECT * \
-                FROM orders
-                WHERE status = $1
-                  AND (scheduled_at IS NULL OR scheduled_at <= NOW())
-                  AND retry_count < $2
-                ORDER BY scheduled_at ASC NULLS FIRST, created_at ASC
-                    LIMIT $3 \
-                """
+            SELECT o.* FROM orders o
+            WHERE o.status = $1
+              AND (o.scheduled_at IS NULL OR o.scheduled_at <= NOW())
+              AND o.retry_count < $2
+            ORDER BY o.scheduled_at ASC NULLS FIRST, o.created_at ASC
+            LIMIT $3
+            FOR UPDATE SKIP LOCKED
+        """
 
         rows = await db.fetch(
             query,
@@ -88,29 +122,58 @@ class OrderRepository(LoggerMixin):
         )
 
         orders = [self._row_to_order(row) for row in rows]
-        self.log_debug(f"Found {len(orders)} pending orders")
+        self.log_debug(f"Found {len(orders)} pending orders (locked)")
         return orders
 
     async def get_orders_by_post(self, post_id: int) -> List[Order]:
         """Get all orders for a post"""
         query = """
-                SELECT * \
-                FROM orders
-                WHERE post_id = $1
-                ORDER BY portion_number, created_at \
-                """
+            SELECT * FROM orders
+            WHERE post_id = $1
+            ORDER BY portion_number, created_at
+        """
         rows = await db.fetch(query, post_id)
 
         return [self._row_to_order(row) for row in rows]
 
+    async def get_orders_by_post_and_type(
+        self,
+        post_id: int,
+        service_type: ServiceType
+    ) -> List[Order]:
+        """Get orders for specific post and service type"""
+        query = """
+            SELECT * FROM orders
+            WHERE post_id = $1 AND service_type = $2
+            ORDER BY created_at
+        """
+        rows = await db.fetch(query, post_id, service_type)
+        return [self._row_to_order(row) for row in rows]
+
+    async def check_emoji_order_exists(
+        self,
+        post_id: int,
+        emoji: str
+    ) -> bool:
+        """Check if order for specific emoji already exists"""
+        query = """
+            SELECT EXISTS(
+                SELECT 1 FROM orders 
+                WHERE post_id = $1 
+                AND service_type = 'reactions'
+                AND reaction_emoji = $2
+                LIMIT 1
+            )
+        """
+        return await db.fetchval(query, post_id, emoji)
+
     async def get_active_orders(self) -> List[Order]:
         """Get all active orders (in progress)"""
         query = """
-                SELECT * \
-                FROM orders
-                WHERE status IN ($1, $2)
-                ORDER BY started_at DESC \
-                """
+            SELECT * FROM orders
+            WHERE status IN ($1, $2)
+            ORDER BY started_at DESC
+        """
         rows = await db.fetch(
             query,
             OrderStatus.IN_PROGRESS,
@@ -181,10 +244,11 @@ class OrderRepository(LoggerMixin):
     async def increment_retry_count(self, order_id: int):
         """Increment retry count for failed order"""
         query = """
-                UPDATE orders
-                SET retry_count = retry_count + 1
-                WHERE id = $1 RETURNING retry_count \
-                """
+            UPDATE orders
+            SET retry_count = retry_count + 1
+            WHERE id = $1 
+            RETURNING retry_count
+        """
 
         new_count = await db.fetchval(query, order_id)
 
@@ -199,14 +263,13 @@ class OrderRepository(LoggerMixin):
     async def get_orders_to_check_status(self, limit: int = 50) -> List[Order]:
         """Get orders that need status check from Twiboost"""
         query = """
-                SELECT * \
-                FROM orders
-                WHERE status IN ($1, $2)
-                  AND twiboost_order_id IS NOT NULL
-                  AND (updated_at < NOW() - INTERVAL '1 minute' OR updated_at IS NULL)
-                ORDER BY updated_at ASC NULLS FIRST
-                    LIMIT $3 \
-                """
+            SELECT * FROM orders
+            WHERE status IN ($1, $2)
+              AND twiboost_order_id IS NOT NULL
+              AND (updated_at < NOW() - INTERVAL '1 minute' OR updated_at IS NULL)
+            ORDER BY updated_at ASC NULLS FIRST
+            LIMIT $3
+        """
 
         rows = await db.fetch(
             query,
@@ -234,6 +297,34 @@ class OrderRepository(LoggerMixin):
                     status,
                     response_data=data
                 )
+
+    async def cleanup_duplicate_orders(self):
+        """Remove duplicate orders (maintenance function)"""
+        query = """
+            WITH duplicates AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY post_id, service_type, 
+                                       COALESCE(reaction_emoji, ''), 
+                                       portion_number
+                           ORDER BY created_at
+                       ) AS row_num
+                FROM orders
+            )
+            DELETE FROM orders
+            WHERE id IN (
+                SELECT id FROM duplicates WHERE row_num > 1
+            )
+            RETURNING id
+        """
+
+        deleted_ids = await db.fetch(query)
+        count = len(deleted_ids)
+
+        if count > 0:
+            self.log_warning(f"Cleaned up {count} duplicate orders")
+
+        return count
 
     async def get_statistics(
             self,
@@ -310,9 +401,9 @@ class OrderRepository(LoggerMixin):
     ):
         """Create execution log entry"""
         query = """
-                INSERT INTO execution_logs (order_id, action, details)
-                VALUES ($1, $2, $3) \
-                """
+            INSERT INTO execution_logs (order_id, action, details)
+            VALUES ($1, $2, $3)
+        """
 
         await db.execute(query, order_id, action, json.dumps(details))
 
@@ -323,12 +414,11 @@ class OrderRepository(LoggerMixin):
     ) -> List[ExecutionLog]:
         """Get execution logs for order"""
         query = """
-                SELECT * \
-                FROM execution_logs
-                WHERE order_id = $1
-                ORDER BY created_at DESC
-                    LIMIT $2 \
-                """
+            SELECT * FROM execution_logs
+            WHERE order_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        """
 
         rows = await db.fetch(query, order_id, limit)
 

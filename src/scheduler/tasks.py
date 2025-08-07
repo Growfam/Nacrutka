@@ -14,6 +14,7 @@ from src.services.twiboost_client import twiboost_client
 from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
 from src.database.repositories.service_repo import service_repo
+from src.database.repositories.order_repo import order_repo
 from src.utils.logger import get_logger, LoggerMixin
 from src.config import settings
 
@@ -27,6 +28,7 @@ class TaskScheduler(LoggerMixin):
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
         self.tasks_running = False
+        self._process_posts_running = False  # ДОДАНО: Flag for preventing duplicate processing
         self.task_stats = {
             "process_posts": {"runs": 0, "errors": 0},
             "execute_orders": {"runs": 0, "errors": 0},
@@ -118,21 +120,50 @@ class TaskScheduler(LoggerMixin):
             self.log_info("Scheduler stopped")
 
     async def _process_posts_task(self):
-        """Task: Process new posts"""
+        """Task: Process new posts with duplicate prevention"""
         task_name = "process_posts"
+
+        # ДОДАНО: Check if already running
+        if self._process_posts_running:
+            self.log_debug(f"Task {task_name} already running, skipping")
+            return
+
         try:
+            self._process_posts_running = True
             self.log_debug(f"Running task: {task_name}")
 
+            # ДОДАНО: Reset stuck posts first
+            stuck_count = await post_repo.reset_stuck_processing(minutes=30)
+            if stuck_count > 0:
+                self.log_info(f"Reset {stuck_count} stuck posts before processing")
+
+            # ДОДАНО: Check how many unprocessed posts
+            unprocessed = await post_repo.get_unprocessed_posts_count()
+            if unprocessed > 0:
+                self.log_info(f"Found {unprocessed} unprocessed posts total")
+
+            # Process posts
             result = await post_processor.process_new_posts(limit=50)
 
             self.task_stats[task_name]["runs"] += 1
 
             if result > 0:
-                self.log_info(f"Processed {result} new posts")
+                self.log_info(
+                    f"Processed {result} new posts",
+                    total_unprocessed_remaining=unprocessed - result
+                )
+
+            # ДОДАНО: Cleanup duplicates every 100 runs
+            if self.task_stats[task_name]["runs"] % 100 == 0:
+                duplicates = await order_repo.cleanup_duplicate_orders()
+                if duplicates > 0:
+                    self.log_warning(f"Cleaned {duplicates} duplicate orders")
 
         except Exception as e:
             self.task_stats[task_name]["errors"] += 1
             self.log_error(f"Task {task_name} failed", error=e)
+        finally:
+            self._process_posts_running = False
 
     async def _execute_orders_task(self):
         """Task: Execute pending orders"""
@@ -174,26 +205,26 @@ class TaskScheduler(LoggerMixin):
         try:
             self.log_info(f"Running task: {task_name}")
 
-            # 1. Отримуємо сервіси з API
+            # 1. Get services from API
             services = await twiboost_client.get_services(force_refresh=True)
 
-            # 2. ВАЖЛИВО! Зберігаємо всі сервіси в БД з їх оригінальними ID
+            # 2. ВАЖЛИВО! Save all services to DB with their original IDs
             synced_count = await service_repo.sync_services(services)
 
             self.log_info(f"Synced {synced_count} Telegram services to database")
 
-            # 3. Отримуємо сервіси з БД для оновлення каналів
+            # 3. Get services from DB for channel updates
             view_services = await service_repo.get_services_by_type("views")
             reaction_mapping = await service_repo.get_reaction_services()
             repost_services = await service_repo.get_services_by_type("reposts")
 
-            # 4. Оновлюємо service_ids для всіх каналів
+            # 4. Update service_ids for all channels
             channels = await channel_repo.get_active_channels()
 
             for channel in channels:
-                # Оновлюємо views
+                # Update views
                 if view_services:
-                    # Шукаємо оптимальний сервіс (наприклад з "10 в минуту")
+                    # Find optimal service (e.g., with "10 в минуту")
                     best_view = None
                     for service in view_services:
                         if '10 в минуту' in service.name or '10 в мин' in service.name:
@@ -213,7 +244,7 @@ class TaskScheduler(LoggerMixin):
                         f"Channel {channel.id}: views service set to {best_view}"
                     )
 
-                # Оновлюємо reactions
+                # Update reactions
                 if reaction_mapping:
                     await channel_repo.update_service_ids(
                         channel.id,
@@ -226,7 +257,7 @@ class TaskScheduler(LoggerMixin):
                         mapping=reaction_mapping
                     )
 
-                # Оновлюємо reposts
+                # Update reposts
                 if repost_services:
                     await channel_repo.update_service_ids(
                         channel.id,
@@ -237,6 +268,9 @@ class TaskScheduler(LoggerMixin):
                     self.log_debug(
                         f"Channel {channel.id}: repost service set to {repost_services[0].service_id}"
                     )
+
+            # ДОДАНО: Ensure all channels have usernames
+            await channel_repo.ensure_all_usernames()
 
             self.task_stats[task_name]["runs"] += 1
 
@@ -284,12 +318,16 @@ class TaskScheduler(LoggerMixin):
             # Clean old orders (7 days)
             orders_deleted = await order_manager.cleanup_completed_orders(days=7)
 
+            # ДОДАНО: Clean duplicate orders
+            duplicates_deleted = await order_repo.cleanup_duplicate_orders()
+
             self.task_stats[task_name]["runs"] += 1
 
             self.log_info(
                 "Cleanup completed",
                 posts_deleted=posts_deleted,
-                orders_deleted=orders_deleted
+                orders_deleted=orders_deleted,
+                duplicates_deleted=duplicates_deleted
             )
 
         except Exception as e:
@@ -313,6 +351,7 @@ class TaskScheduler(LoggerMixin):
                 "📊 WEEKLY STATISTICS",
                 posts_processed=post_stats.get("total", 0),
                 posts_success_rate=post_stats.get("success_rate", 0),
+                posts_unprocessed=post_stats.get("unprocessed", 0),
                 orders_executed=order_stats.get("total_orders", 0),
                 orders_success_rate=order_stats.get("success_rate", 0),
                 active_orders=order_stats.get("active_orders", 0),

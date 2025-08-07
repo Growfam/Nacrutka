@@ -1,6 +1,6 @@
 -- Telegram SMM Bot Database Schema
--- Version: 1.0.0
--- Description: Initial schema for automated SMM services
+-- Version: 1.0.1 - FIXED
+-- Description: Initial schema with duplicate prevention
 
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -70,7 +70,7 @@ CREATE INDEX idx_channel_settings_channel ON channel_settings(channel_id);
 CREATE INDEX idx_channel_settings_enabled ON channel_settings(is_enabled) WHERE is_enabled = true;
 
 -- ============================================
--- 3. POSTS TABLE
+-- 3. POSTS TABLE - FIXED
 -- ============================================
 CREATE TABLE posts (
     id SERIAL PRIMARY KEY,
@@ -79,6 +79,12 @@ CREATE TABLE posts (
     content TEXT,
     media_type VARCHAR(50),  -- 'photo', 'video', 'text', etc.
     status VARCHAR(50) NOT NULL DEFAULT 'new',  -- 'new', 'processing', 'completed', 'failed'
+
+    -- ДОДАНО: для правильних посилань
+    channel_username VARCHAR(255),
+
+    -- ДОДАНО: для контролю дублікатів
+    orders_created BOOLEAN DEFAULT FALSE,
 
     -- Stats
     views_count INTEGER DEFAULT 0,
@@ -95,9 +101,11 @@ CREATE INDEX idx_posts_status ON posts(status);
 CREATE INDEX idx_posts_channel ON posts(channel_id);
 CREATE INDEX idx_posts_detected ON posts(detected_at DESC);
 CREATE INDEX idx_posts_new ON posts(status) WHERE status = 'new';
+-- ДОДАНО: індекс для швидкого пошуку необроблених
+CREATE INDEX idx_posts_unprocessed ON posts(orders_created) WHERE orders_created = FALSE;
 
 -- ============================================
--- 4. ORDERS TABLE
+-- 4. ORDERS TABLE - FIXED
 -- ============================================
 CREATE TABLE orders (
     id SERIAL PRIMARY KEY,
@@ -138,6 +146,19 @@ CREATE TABLE orders (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- ВАЖЛИВО: УНІКАЛЬНІ ІНДЕКСИ ДЛЯ ЗАПОБІГАННЯ ДУБЛІКАТІВ
+CREATE UNIQUE INDEX idx_unique_order_view
+    ON orders(post_id, service_type, portion_number)
+    WHERE service_type = 'views';
+
+CREATE UNIQUE INDEX idx_unique_order_reaction
+    ON orders(post_id, service_type, reaction_emoji)
+    WHERE service_type = 'reactions' AND reaction_emoji IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_unique_order_repost
+    ON orders(post_id, service_type)
+    WHERE service_type = 'reposts';
 
 CREATE INDEX idx_orders_post ON orders(post_id);
 CREATE INDEX idx_orders_status ON orders(status);
@@ -184,7 +205,7 @@ CREATE INDEX idx_twiboost_type ON twiboost_services(type);
 CREATE INDEX idx_twiboost_active ON twiboost_services(is_active) WHERE is_active = true;
 
 -- ============================================
--- HELPER FUNCTIONS
+-- HELPER FUNCTIONS - FIXED
 -- ============================================
 
 -- Function to update timestamps
@@ -207,7 +228,47 @@ CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON orders
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================
--- STORED PROCEDURES
+-- NEW FUNCTIONS FOR DUPLICATE PREVENTION
+-- ============================================
+
+-- Check if orders exist for post
+CREATE OR REPLACE FUNCTION check_orders_exist(p_post_id INTEGER)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS(
+        SELECT 1 FROM orders
+        WHERE post_id = p_post_id
+        LIMIT 1
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Check if specific emoji order exists
+CREATE OR REPLACE FUNCTION check_emoji_order_exists(p_post_id INTEGER, p_emoji VARCHAR)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS(
+        SELECT 1 FROM orders
+        WHERE post_id = p_post_id
+        AND service_type = 'reactions'
+        AND reaction_emoji = p_emoji
+        LIMIT 1
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Mark post as having orders
+CREATE OR REPLACE FUNCTION mark_post_orders_created(p_post_id INTEGER)
+RETURNS VOID AS $$
+BEGIN
+    UPDATE posts
+    SET orders_created = TRUE
+    WHERE id = p_post_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================
+-- STORED PROCEDURES - UPDATED
 -- ============================================
 
 -- Get pending orders for processing
@@ -239,8 +300,10 @@ BEGIN
     JOIN posts p ON o.post_id = p.id
     WHERE o.status = 'pending'
         AND (o.scheduled_at IS NULL OR o.scheduled_at <= NOW())
+        AND o.retry_count < 3  -- max retries
     ORDER BY o.created_at
-    LIMIT p_limit;
+    LIMIT p_limit
+    FOR UPDATE SKIP LOCKED;  -- ВАЖЛИВО: запобігає паралельній обробці
 END;
 $$ LANGUAGE plpgsql;
 
@@ -259,29 +322,28 @@ BEGIN
         reactions_count = CASE WHEN p_service_type = 'reactions'
             THEN reactions_count + p_count ELSE reactions_count END,
         reposts_count = CASE WHEN p_service_type = 'reposts'
-            THEN reposts_count + p_count ELSE reposts_count END
+            THEN reposts_count + p_count ELSE reposts_count END,
+        orders_created = TRUE
     WHERE id = p_post_id;
 END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================
--- SAMPLE DATA (for testing)
+-- MIGRATION HELPERS
 -- ============================================
 
--- Insert sample channel
--- INSERT INTO channels (id, username, title)
--- VALUES (-1001234567890, 'test_channel', 'Test Channel');
+-- Add columns if they don't exist (for migration)
+DO $$
+BEGIN
+    -- Add channel_username to posts if not exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='posts' AND column_name='channel_username') THEN
+        ALTER TABLE posts ADD COLUMN channel_username VARCHAR(255);
+    END IF;
 
--- Insert sample settings
--- INSERT INTO channel_settings (channel_id, service_type, base_quantity, randomization_percent)
--- VALUES
--- (-1001234567890, 'views', 1000, 0),
--- (-1001234567890, 'reactions', 100, 40),
--- (-1001234567890, 'reposts', 50, 40);
-
--- ============================================
--- PERMISSIONS (adjust for your user)
--- ============================================
--- GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO your_user;
--- GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO your_user;
--- GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO your_user;
+    -- Add orders_created to posts if not exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='posts' AND column_name='orders_created') THEN
+        ALTER TABLE posts ADD COLUMN orders_created BOOLEAN DEFAULT FALSE;
+    END IF;
+END $$;

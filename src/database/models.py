@@ -130,15 +130,23 @@ class Post:
     status: PostStatus = PostStatus.NEW
     detected_at: datetime = None
     processed_at: Optional[datetime] = None
+    channel_username: Optional[str] = None  # ДОДАНО: username каналу
 
     @property
     def link(self) -> str:
         """Generate Telegram link to post"""
-        # Format: https://t.me/c/CHANNEL_ID/MESSAGE_ID
-        # Remove the negative sign and first 100 from channel_id for private channels
+        # ВИПРАВЛЕНО: Використовуємо правильний формат посилань
+
+        # Якщо є username - використовуємо публічне посилання
+        if self.channel_username:
+            return f"https://t.me/{self.channel_username}/{self.message_id}"
+
+        # Для приватних каналів використовуємо формат /c/
+        # Видаляємо -100 префікс для приватних каналів
         channel_str = str(abs(self.channel_id))
-        if len(channel_str) > 10:  # Private channel
-            channel_str = channel_str[3:]  # Remove -100 prefix
+        if len(channel_str) > 10:  # Private channel має префікс -100
+            channel_str = channel_str[3:]  # Видаляємо перші 3 символи (100)
+
         return f"https://t.me/c/{channel_str}/{self.message_id}"
 
 
