@@ -11,6 +11,7 @@ from telegram.ext import Application
 from src.config import settings
 from src.utils.logger import setup_logging, get_logger
 from src.database.connection import db, test_connection
+from src.database.repositories.service_repo import service_repo
 from src.bot.telegram_monitor import TelegramMonitor, telegram_monitor
 from src.bot.handlers import BotHandlers
 from src.scheduler.tasks import task_scheduler
@@ -54,10 +55,34 @@ class TelegramSMMBot:
             balance = await twiboost_client.get_balance()
             logger.info(f"✅ Twiboost connected. Balance: {balance['balance']} {balance['currency']}")
 
-            # 3. Sync Twiboost services
-            logger.info("Syncing Twiboost services...")
+            # 3. ВАЖЛИВО! Синхронізуємо сервіси з API в БД при старті
+            logger.info("🔄 Syncing Twiboost services to database...")
             services = await twiboost_client.get_services()
-            logger.info(f"✅ Found {len(services)} Twiboost services")
+            logger.info(f"✅ Found {len(services)} total services from API")
+
+            # Зберігаємо сервіси в БД
+            synced_count = await service_repo.sync_services(services)
+            logger.info(f"✅ Synced {synced_count} Telegram services to database")
+
+            # Перевіряємо що є в БД
+            view_services = await service_repo.get_services_by_type("views")
+            reaction_services = await service_repo.get_services_by_type("reactions")
+            repost_services = await service_repo.get_services_by_type("reposts")
+
+            logger.info(
+                f"📊 Services in database:\n"
+                f"  • Views: {len(view_services)} services\n"
+                f"  • Reactions: {len(reaction_services)} services\n"
+                f"  • Reposts: {len(repost_services)} services"
+            )
+
+            # Виводимо приклади ID для налагодження
+            if view_services:
+                logger.info(f"  Example view service: ID={view_services[0].service_id}, Name={view_services[0].name[:50]}")
+            if reaction_services:
+                logger.info(f"  Example reaction service: ID={reaction_services[0].service_id}, Name={reaction_services[0].name[:50]}")
+            if repost_services:
+                logger.info(f"  Example repost service: ID={repost_services[0].service_id}, Name={repost_services[0].name[:50]}")
 
             # 4. Initialize Telegram bot
             logger.info("Initializing Telegram bot...")
@@ -80,7 +105,51 @@ class TelegramSMMBot:
             logger.info("Validating existing channels...")
             await self.monitor.validate_all_channels()
 
-            # 8. Start scheduler
+            # 8. Оновлюємо service_ids для всіх каналів
+            logger.info("Updating channel service mappings...")
+            channels = await channel_repo.get_active_channels()
+
+            for channel in channels:
+                # Отримуємо маппінг реакцій
+                reaction_mapping = await service_repo.get_reaction_services()
+
+                # Оновлюємо views
+                if view_services:
+                    # Шукаємо оптимальний сервіс
+                    best_view = None
+                    for service in view_services:
+                        if '10 в минуту' in service.name or '10 в мин' in service.name:
+                            best_view = service.service_id
+                            break
+
+                    if not best_view:
+                        best_view = view_services[0].service_id
+
+                    await channel_repo.update_service_ids(
+                        channel.id,
+                        "views",
+                        {"views": best_view}
+                    )
+
+                # Оновлюємо reactions
+                if reaction_mapping:
+                    await channel_repo.update_service_ids(
+                        channel.id,
+                        "reactions",
+                        reaction_mapping
+                    )
+
+                # Оновлюємо reposts
+                if repost_services:
+                    await channel_repo.update_service_ids(
+                        channel.id,
+                        "reposts",
+                        {"reposts": repost_services[0].service_id}
+                    )
+
+                logger.info(f"✅ Updated service mappings for channel: {channel.title}")
+
+            # 9. Start scheduler
             logger.info("Starting task scheduler...")
             await task_scheduler.start()
             logger.info("✅ Scheduler started")

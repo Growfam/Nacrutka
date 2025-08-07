@@ -13,6 +13,7 @@ from src.services.order_manager import order_manager
 from src.services.twiboost_client import twiboost_client
 from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
+from src.database.repositories.service_repo import service_repo
 from src.utils.logger import get_logger, LoggerMixin
 from src.config import settings
 
@@ -173,45 +174,34 @@ class TaskScheduler(LoggerMixin):
         try:
             self.log_info(f"Running task: {task_name}")
 
-            # Get services from API
+            # 1. Отримуємо сервіси з API
             services = await twiboost_client.get_services(force_refresh=True)
 
-            # Find Telegram services by name (since type is "Default" for all)
-            view_services = []
-            reaction_services = []
-            repost_services = []
+            # 2. ВАЖЛИВО! Зберігаємо всі сервіси в БД з їх оригінальними ID
+            synced_count = await service_repo.sync_services(services)
 
-            for service in services:
-                name_lower = service.get("name", "").lower()
+            self.log_info(f"Synced {synced_count} Telegram services to database")
 
-                # Check for Telegram views
-                if ('telegram' in name_lower or 'телеграм' in name_lower):
-                    if 'просмотр' in name_lower or 'view' in name_lower:
-                        view_services.append(service)
-                    elif 'реакц' in name_lower or 'reaction' in name_lower or 'эмодз' in name_lower:
-                        reaction_services.append(service)
-                    elif 'репост' in name_lower or 'repost' in name_lower or 'share' in name_lower:
-                        repost_services.append(service)
+            # 3. Отримуємо сервіси з БД для оновлення каналів
+            view_services = await service_repo.get_services_by_type("views")
+            reaction_mapping = await service_repo.get_reaction_services()
+            repost_services = await service_repo.get_services_by_type("reposts")
 
-            self.log_info(
-                f"Found Telegram services: {len(view_services)} views, "
-                f"{len(reaction_services)} reactions, {len(repost_services)} reposts"
-            )
-
-            # Update service IDs for all channels
+            # 4. Оновлюємо service_ids для всіх каналів
             channels = await channel_repo.get_active_channels()
 
             for channel in channels:
-                # Set best view service (usually the one with flexible speed)
+                # Оновлюємо views
                 if view_services:
-                    # Try to find service with "10 в минуту" as a good balance
+                    # Шукаємо оптимальний сервіс (наприклад з "10 в минуту")
                     best_view = None
-                    for s in view_services:
-                        if '10 в минуту' in s['name']:
-                            best_view = s['service']
+                    for service in view_services:
+                        if '10 в минуту' in service.name or '10 в мин' in service.name:
+                            best_view = service.service_id
                             break
+
                     if not best_view:
-                        best_view = view_services[0]['service']
+                        best_view = view_services[0].service_id
 
                     await channel_repo.update_service_ids(
                         channel.id,
@@ -219,32 +209,43 @@ class TaskScheduler(LoggerMixin):
                         {"views": best_view}
                     )
 
-                # For reactions - need to map specific emojis
-                if reaction_services:
-                    reaction_mapping = {}
-                    for service in reaction_services:
-                        # Try to detect emoji from name
-                        for emoji in ["👍", "❤️", "🔥", "😊", "😢", "😮", "😡"]:
-                            if emoji in service['name']:
-                                reaction_mapping[f"reaction_{emoji}"] = service['service']
+                    self.log_debug(
+                        f"Channel {channel.id}: views service set to {best_view}"
+                    )
 
-                    if reaction_mapping:
-                        await channel_repo.update_service_ids(
-                            channel.id,
-                            "reactions",
-                            reaction_mapping
-                        )
+                # Оновлюємо reactions
+                if reaction_mapping:
+                    await channel_repo.update_service_ids(
+                        channel.id,
+                        "reactions",
+                        reaction_mapping
+                    )
 
-                # For reposts
+                    self.log_debug(
+                        f"Channel {channel.id}: reaction services mapped",
+                        mapping=reaction_mapping
+                    )
+
+                # Оновлюємо reposts
                 if repost_services:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "reposts",
-                        {"reposts": repost_services[0]['service']}
+                        {"reposts": repost_services[0].service_id}
+                    )
+
+                    self.log_debug(
+                        f"Channel {channel.id}: repost service set to {repost_services[0].service_id}"
                     )
 
             self.task_stats[task_name]["runs"] += 1
-            self.log_info(f"Synced {len(services)} services")
+
+            self.log_info(
+                "Service sync completed",
+                total_services=len(services),
+                synced_to_db=synced_count,
+                channels_updated=len(channels)
+            )
 
         except Exception as e:
             self.task_stats[task_name]["errors"] += 1

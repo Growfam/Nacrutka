@@ -13,6 +13,7 @@ from src.database.models import (
 from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
 from src.database.repositories.order_repo import order_repo
+from src.database.repositories.service_repo import service_repo
 from src.core.portion_calculator import portion_calculator
 from src.services.twiboost_client import twiboost_client
 from src.utils.logger import get_logger, LoggerMixin, metrics
@@ -144,23 +145,40 @@ class PostProcessor(LoggerMixin):
     ) -> List[Order]:
         """Create orders for views"""
 
-        # Get service ID from settings or use default
+        # Спочатку перевіряємо збережені service_ids
         service_ids = settings.twiboost_service_ids or {}
         service_id = service_ids.get("views")
 
+        # Якщо немає збереженого - шукаємо в БД
         if not service_id:
-            # Try to find service from API
-            service = await twiboost_client.get_service_by_type("view", "telegram")
+            # Шукаємо найкращий сервіс для views в БД
+            service = await service_repo.find_best_service(
+                service_type="views",
+                quantity=settings.base_quantity,
+                name_filter="10 в минуту"  # Пріоритет для гнучкої швидкості
+            )
+
+            if not service:
+                # Якщо не знайшли специфічний - беремо будь-який
+                services = await service_repo.get_services_by_type("views")
+                if services:
+                    service = services[0]
+
             if service:
-                service_id = service["service"]
-                # Save for future use
+                service_id = service.service_id
+                # Зберігаємо для наступного разу
                 await channel_repo.update_service_ids(
                     post.channel_id,
                     ServiceType.VIEWS,
                     {"views": service_id}
                 )
+                self.log_info(
+                    "View service selected from DB",
+                    service_id=service_id,
+                    service_name=service.name
+                )
             else:
-                raise ValueError("No view service found")
+                raise ValueError("No view service found in database")
 
         # Calculate portions (no randomization for views)
         portions = portion_calculator.calculate_portions(
@@ -221,22 +239,26 @@ class PostProcessor(LoggerMixin):
             settings.reaction_distribution
         )
 
-        # Get service IDs
-        service_ids = settings.twiboost_service_ids or {}
+        # Отримуємо маппінг реакцій з БД
+        reaction_mapping = await service_repo.get_reaction_services()
+
+        if not reaction_mapping:
+            self.log_error("No reaction services found in database")
+            return []
 
         # Create order for each reaction type
         orders = []
         for emoji, quantity in reaction_quantities.items():
             # Find service ID for this reaction
             service_key = f"reaction_{emoji}"
-            service_id = service_ids.get(service_key)
+            service_id = reaction_mapping.get(service_key)
 
             if not service_id:
-                # Try to find from API
-                service = await twiboost_client.get_service_by_type("reaction", emoji)
-                if service:
-                    service_id = service["service"]
-                else:
+                # Спробуємо знайти в збережених налаштуваннях
+                service_ids = settings.twiboost_service_ids or {}
+                service_id = service_ids.get(service_key)
+
+                if not service_id:
                     self.log_warning(f"No service found for reaction {emoji}")
                     continue
 
@@ -267,7 +289,8 @@ class PostProcessor(LoggerMixin):
                 emoji=emoji,
                 quantity=quantity,
                 runs=runs,
-                interval=settings.run_interval
+                interval=settings.run_interval,
+                service_id=service_id
             )
 
         return orders
@@ -279,23 +302,39 @@ class PostProcessor(LoggerMixin):
     ) -> List[Order]:
         """Create orders for reposts"""
 
-        # Get service ID
+        # Спочатку перевіряємо збережені service_ids
         service_ids = settings.twiboost_service_ids or {}
         service_id = service_ids.get("reposts")
 
+        # Якщо немає збереженого - шукаємо в БД
         if not service_id:
-            # Try to find service from API
-            service = await twiboost_client.get_service_by_type("repost", "telegram")
+            # Шукаємо сервіс для репостів в БД
+            service = await service_repo.find_best_service(
+                service_type="reposts",
+                quantity=settings.base_quantity
+            )
+
+            if not service:
+                # Беремо будь-який доступний
+                services = await service_repo.get_services_by_type("reposts")
+                if services:
+                    service = services[0]
+
             if service:
-                service_id = service["service"]
-                # Save for future use
+                service_id = service.service_id
+                # Зберігаємо для наступного разу
                 await channel_repo.update_service_ids(
                     post.channel_id,
                     ServiceType.REPOSTS,
                     {"reposts": service_id}
                 )
+                self.log_info(
+                    "Repost service selected from DB",
+                    service_id=service_id,
+                    service_name=service.name
+                )
             else:
-                self.log_warning("No repost service found")
+                self.log_warning("No repost service found in database")
                 return []
 
         # Calculate portions (with randomization)
@@ -335,7 +374,8 @@ class PostProcessor(LoggerMixin):
             order_id=order.id,
             quantity=portion.quantity,
             runs=runs,
-            scheduled_at=portion.scheduled_at
+            scheduled_at=portion.scheduled_at,
+            service_id=service_id
         )
 
         return [order]
