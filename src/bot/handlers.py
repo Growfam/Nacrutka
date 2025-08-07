@@ -1,7 +1,7 @@
 """
 Bot command handlers for admin interface
 """
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -22,6 +22,7 @@ from src.bot.telegram_monitor import telegram_monitor
 from src.utils.logger import get_logger
 from src.config import settings
 
+
 logger = get_logger(__name__)
 
 
@@ -34,7 +35,6 @@ class BotHandlers:
 
     def setup_handlers(self):
         """Register all command handlers"""
-
         # Admin check decorator
         def admin_only(func):
             async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -43,7 +43,6 @@ class BotHandlers:
                     await update.message.reply_text("❌ Access denied. Admin only.")
                     return
                 return await func(update, context)
-
             return wrapper
 
         # Commands
@@ -465,5 +464,6 @@ class BotHandlers:
                 "/settings `<channel_id>`",
                 parse_mode=ParseMode.MARKDOWN
             )
+
 
 # Bot handlers will be initialized in main.py

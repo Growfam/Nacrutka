@@ -2,6 +2,7 @@
 Scheduler for periodic tasks
 """
 import asyncio
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -14,6 +15,7 @@ from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
 from src.utils.logger import get_logger, LoggerMixin
 from src.config import settings
+
 
 logger = get_logger(__name__)
 

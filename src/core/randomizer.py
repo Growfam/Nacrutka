@@ -3,13 +3,14 @@ Randomizer for natural-looking promotion
 """
 import random
 import hashlib
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from src.database.models import ServiceType, ChannelSettings
 from src.utils.logger import get_logger, LoggerMixin
 from src.config import DEFAULT_REACTIONS
+
 
 logger = get_logger(__name__)
 
@@ -31,12 +32,12 @@ class Randomizer(LoggerMixin):
         self.cache_size = 10  # Remember last N values per channel/service
 
     def randomize_quantity(
-            self,
-            base_quantity: int,
-            randomization_percent: int,
-            service_type: ServiceType,
-            channel_id: int,
-            post_id: int
+        self,
+        base_quantity: int,
+        randomization_percent: int,
+        service_type: ServiceType,
+        channel_id: int,
+        post_id: int
     ) -> RandomizedValue:
         """
         Randomize quantity with smart distribution
@@ -95,11 +96,11 @@ class Randomizer(LoggerMixin):
         )
 
     def randomize_reaction_distribution(
-            self,
-            base_distribution: Dict[str, int],
-            total_quantity: int,
-            channel_id: int,
-            post_id: int
+        self,
+        base_distribution: Dict[str, int],
+        total_quantity: int,
+        channel_id: int,
+        post_id: int
     ) -> Dict[str, int]:
         """
         Randomize reaction emoji distribution
@@ -170,9 +171,9 @@ class Randomizer(LoggerMixin):
         return result
 
     def randomize_intervals(
-            self,
-            base_interval: int,
-            variation_percent: int = 20
+        self,
+        base_interval: int,
+        variation_percent: int = 20
     ) -> int:
         """
         Randomize time intervals
@@ -188,9 +189,9 @@ class Randomizer(LoggerMixin):
         return random.randint(min_interval, max_interval)
 
     def randomize_delay(
-            self,
-            base_delay_minutes: int,
-            max_additional_minutes: int = 3
+        self,
+        base_delay_minutes: int,
+        max_additional_minutes: int = 3
     ) -> timedelta:
         """
         Randomize start delay
@@ -206,10 +207,10 @@ class Randomizer(LoggerMixin):
         return timedelta(minutes=total_minutes, seconds=additional_seconds)
 
     def generate_portion_sizes(
-            self,
-            total: int,
-            portions_count: int,
-            fast_percent: int = 70
+        self,
+        total: int,
+        portions_count: int,
+        fast_percent: int = 70
     ) -> List[int]:
         """
         Generate randomized portion sizes
@@ -272,21 +273,21 @@ class Randomizer(LoggerMixin):
         return portions
 
     def _generate_seed(
-            self,
-            channel_id: int,
-            post_id: int,
-            service_type: str
+        self,
+        channel_id: int,
+        post_id: int,
+        service_type: str
     ) -> str:
         """Generate deterministic seed for randomization"""
         data = f"{channel_id}_{post_id}_{service_type}_{datetime.now().date()}"
         return hashlib.md5(data.encode()).hexdigest()
 
     def _generate_unique_value(
-            self,
-            min_value: int,
-            max_value: int,
-            cache_key: str,
-            seed: str
+        self,
+        min_value: int,
+        max_value: int,
+        cache_key: str,
+        seed: str
     ) -> int:
         """Generate value that's different from recent values"""
 
@@ -324,9 +325,9 @@ class Randomizer(LoggerMixin):
         return random.randint(min_value, max_value)
 
     def should_skip_randomization(
-            self,
-            service_type: ServiceType,
-            is_test_mode: bool = False
+        self,
+        service_type: ServiceType,
+        is_test_mode: bool = False
     ) -> bool:
         """Check if randomization should be skipped"""
 

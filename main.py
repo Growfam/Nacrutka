@@ -17,6 +17,7 @@ from src.scheduler.tasks import task_scheduler
 from src.services.twiboost_client import twiboost_client
 from src.database.repositories.channel_repo import channel_repo
 
+
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)

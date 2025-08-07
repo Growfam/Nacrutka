@@ -12,6 +12,7 @@ from src.services.twiboost_client import twiboost_client, TwiboostAPIError
 from src.utils.logger import get_logger, LoggerMixin, metrics
 from src.config import settings
 
+
 logger = get_logger(__name__)
 
 
@@ -290,13 +291,12 @@ class OrderManager(LoggerMixin):
         try:
             # Get failed orders with retry count < max
             query = """
-                    SELECT * \
-                    FROM orders
-                    WHERE status = $1
-                      AND retry_count < $2
-                    ORDER BY created_at DESC
-                        LIMIT $3 \
-                    """
+                SELECT * FROM orders 
+                WHERE status = $1 
+                    AND retry_count < $2
+                ORDER BY created_at DESC
+                LIMIT $3
+            """
 
             rows = await db.fetch(
                 query,
