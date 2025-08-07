@@ -43,8 +43,8 @@ class APIProvider(str, Enum):
 class Channel:
     """Telegram channel model"""
     id: int  # Telegram channel ID
-    username: Optional[str]
     title: str
+    username: Optional[str] = None
     is_active: bool = True
     monitoring_interval: int = 30  # seconds
     created_at: Optional[datetime] = None
@@ -65,35 +65,22 @@ class Channel:
 @dataclass
 class ChannelSettings:
     """Channel SMM settings model"""
-    id: Optional[int]
     channel_id: int
     service_type: ServiceType
-
-    # Base settings
     base_quantity: int
-    randomization_percent: int = 0
 
-    # Portion settings
+    # Optional fields with defaults
+    id: Optional[int] = None
+    randomization_percent: int = 0
     portions_count: int = 5
     fast_delivery_percent: int = 70
-
-    # Reaction specific
     reaction_distribution: Optional[Dict[str, int]] = None  # {"👍": 45, "❤️": 30}
-
-    # Repost specific
     repost_delay_minutes: int = 5
-
-    # Service mappings for both APIs
     twiboost_service_ids: Optional[Dict[str, int]] = None  # {"service_name": service_id}
     nakrutochka_service_ids: Optional[Dict[str, int]] = None  # {"service_name": service_id}
-
-    # API preferences
     api_preferences: Optional[Dict[str, str]] = None  # {"views": "twiboost", "reactions": "nakrutochka"}
-
-    # Drip-feed settings
     drops_per_run: int = 5  # количество за один запуск
     run_interval: int = 30  # интервал между запусками в минутах
-
     updated_at: Optional[datetime] = None
 
     def calculate_runs(self, total_quantity: int) -> int:
@@ -150,12 +137,14 @@ class ChannelSettings:
 @dataclass
 class Post:
     """Telegram post model"""
-    id: Optional[int]
     channel_id: int
     message_id: int
-    content: Optional[str]
+
+    # Optional fields with defaults
+    id: Optional[int] = None
+    content: Optional[str] = None
     status: PostStatus = PostStatus.NEW
-    detected_at: datetime = None
+    detected_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None
     channel_username: Optional[str] = None
 
@@ -177,41 +166,28 @@ class Post:
 @dataclass
 class Order:
     """SMM order model"""
-    id: Optional[int]
+    # Required fields (без дефолтних значень)
     post_id: int
-
-    # Support for both APIs
-    twiboost_order_id: Optional[int] = None
-    nakrutochka_order_id: Optional[Union[int, str]] = None
-    api_provider: APIProvider = APIProvider.TWIBOOST
-
     service_type: ServiceType
     service_id: int  # Service ID in respective API
-
-    # Quantities
     quantity: int  # Original requested
     actual_quantity: int  # After randomization
 
-    # Portion info
+    # Optional fields (з дефолтними значеннями)
+    id: Optional[int] = None
+    twiboost_order_id: Optional[int] = None
+    nakrutochka_order_id: Optional[Union[int, str]] = None
+    api_provider: APIProvider = APIProvider.TWIBOOST
     portion_number: int = 1
     portion_size: int = 0
-
-    # Drip-feed settings
     runs: Optional[int] = None
     interval: Optional[int] = None  # minutes
-
     status: OrderStatus = OrderStatus.PENDING
-
-    # Timestamps
     scheduled_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-
-    # Response data
     response_data: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
-
-    # For reactions
     reaction_emoji: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -249,11 +225,13 @@ class Order:
 @dataclass
 class ExecutionLog:
     """Execution log model"""
-    id: Optional[int]
     order_id: int
     action: str
     details: Dict[str, Any]
-    created_at: datetime = None
+
+    # Optional fields
+    id: Optional[int] = None
+    created_at: Optional[datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
