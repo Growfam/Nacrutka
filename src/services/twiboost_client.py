@@ -11,6 +11,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from src.config import settings
 from src.utils.logger import get_logger, metrics, LoggerMixin
 
+
 logger = get_logger(__name__)
 
 
@@ -138,21 +139,40 @@ class TwiboostClient(LoggerMixin):
         """Get specific service by type and optional name filter"""
         services = await self.get_services()
 
+        # Since Twiboost uses "Default" type, search by name
         for service in services:
-            if service.get("type") == service_type:
-                if name_filter and name_filter.lower() not in service.get("name", "").lower():
-                    continue
-                return service
+            name_lower = service.get("name", "").lower()
+
+            # Check if it's a Telegram service
+            if 'telegram' not in name_lower and 'телеграм' not in name_lower:
+                continue
+
+            # Check for specific service type
+            if service_type == "view":
+                if 'просмотр' in name_lower or 'view' in name_lower:
+                    if name_filter and name_filter.lower() not in name_lower:
+                        continue
+                    return service
+            elif service_type == "reaction":
+                if 'реакц' in name_lower or 'reaction' in name_lower or 'эмодз' in name_lower:
+                    if name_filter and name_filter.lower() not in name_lower:
+                        continue
+                    return service
+            elif service_type == "repost":
+                if 'репост' in name_lower or 'repost' in name_lower or 'share' in name_lower:
+                    if name_filter and name_filter.lower() not in name_lower:
+                        continue
+                    return service
 
         return None
 
     async def create_order(
-            self,
-            service_id: int,
-            link: str,
-            quantity: int,
-            runs: Optional[int] = None,
-            interval: Optional[int] = None
+        self,
+        service_id: int,
+        link: str,
+        quantity: int,
+        runs: Optional[int] = None,
+        interval: Optional[int] = None
     ) -> int:
         """
         Create new order

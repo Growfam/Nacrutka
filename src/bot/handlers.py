@@ -425,18 +425,47 @@ class BotHandlers:
         try:
             services = await twiboost_client.get_services()
 
-            # Filter relevant services
-            relevant = [s for s in services if s['type'] in ['view', 'reaction', 'repost']]
+            # Filter Telegram services by name instead of type
+            telegram_keywords = ['telegram', 'телеграм', 'tg']
+            relevant = []
 
-            text = f"*🛠 Available Services ({len(relevant)}):*\n\n"
+            for service in services:
+                name_lower = service.get('name', '').lower()
+                for keyword in telegram_keywords:
+                    if keyword in name_lower:
+                        relevant.append(service)
+                        break
 
-            for service in relevant[:20]:  # Limit to 20
-                text += (
-                    f"• ID: {service['service']}\n"
-                    f"  Name: {service['name']}\n"
-                    f"  Type: {service['type']}\n"
-                    f"  Rate: {service['rate']}/1000\n\n"
-                )
+            text = f"*🛠 Telegram Services ({len(relevant)}):*\n\n"
+
+            # Categorize services
+            views = [s for s in relevant if 'просмотр' in s['name'].lower() or 'view' in s['name'].lower()]
+            reactions = [s for s in relevant if 'реакц' in s['name'].lower() or 'reaction' in s['name'].lower()]
+            reposts = [s for s in relevant if 'репост' in s['name'].lower() or 'repost' in s['name'].lower() or 'share' in s['name'].lower()]
+            others = [s for s in relevant if s not in views and s not in reactions and s not in reposts]
+
+            if views:
+                text += "*👁 Views:*\n"
+                for service in views[:5]:
+                    text += f"• ID {service['service']}: {service['name'][:50]}\n  Rate: {service['rate']}/1000\n"
+                text += "\n"
+
+            if reactions:
+                text += "*❤️ Reactions:*\n"
+                for service in reactions[:5]:
+                    text += f"• ID {service['service']}: {service['name'][:50]}\n  Rate: {service['rate']}/1000\n"
+                text += "\n"
+
+            if reposts:
+                text += "*🔄 Reposts:*\n"
+                for service in reposts[:5]:
+                    text += f"• ID {service['service']}: {service['name'][:50]}\n  Rate: {service['rate']}/1000\n"
+                text += "\n"
+
+            if others:
+                text += "*📱 Other Telegram Services:*\n"
+                for service in others[:5]:
+                    text += f"• ID {service['service']}: {service['name'][:50]}\n  Rate: {service['rate']}/1000\n"
 
             await update.message.reply_text(
                 text,

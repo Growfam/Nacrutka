@@ -176,46 +176,71 @@ class TaskScheduler(LoggerMixin):
             # Get services from API
             services = await twiboost_client.get_services(force_refresh=True)
 
+            # Find Telegram services by name (since type is "Default" for all)
+            view_services = []
+            reaction_services = []
+            repost_services = []
+
+            for service in services:
+                name_lower = service.get("name", "").lower()
+
+                # Check for Telegram views
+                if ('telegram' in name_lower or 'телеграм' in name_lower):
+                    if 'просмотр' in name_lower or 'view' in name_lower:
+                        view_services.append(service)
+                    elif 'реакц' in name_lower or 'reaction' in name_lower or 'эмодз' in name_lower:
+                        reaction_services.append(service)
+                    elif 'репост' in name_lower or 'repost' in name_lower or 'share' in name_lower:
+                        repost_services.append(service)
+
+            self.log_info(
+                f"Found Telegram services: {len(view_services)} views, "
+                f"{len(reaction_services)} reactions, {len(repost_services)} reposts"
+            )
+
             # Update service IDs for all channels
             channels = await channel_repo.get_active_channels()
 
             for channel in channels:
-                # Find relevant services for this channel
-                view_service = None
-                reaction_services = {}
-                repost_service = None
+                # Set best view service (usually the one with flexible speed)
+                if view_services:
+                    # Try to find service with "10 в минуту" as a good balance
+                    best_view = None
+                    for s in view_services:
+                        if '10 в минуту' in s['name']:
+                            best_view = s['service']
+                            break
+                    if not best_view:
+                        best_view = view_services[0]['service']
 
-                for service in services:
-                    if service["type"] == "view" and "telegram" in service["name"].lower():
-                        view_service = service["service"]
-                    elif service["type"] == "reaction" and "telegram" in service["name"].lower():
-                        # Try to detect emoji from name
-                        for emoji in ["👍", "❤️", "🔥", "😊", "😢", "😮", "😡"]:
-                            if emoji in service["name"]:
-                                reaction_services[f"reaction_{emoji}"] = service["service"]
-                    elif service["type"] == "repost" and "telegram" in service["name"].lower():
-                        repost_service = service["service"]
-
-                # Update settings
-                if view_service:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "views",
-                        {"views": view_service}
+                        {"views": best_view}
                     )
 
+                # For reactions - need to map specific emojis
                 if reaction_services:
-                    await channel_repo.update_service_ids(
-                        channel.id,
-                        "reactions",
-                        reaction_services
-                    )
+                    reaction_mapping = {}
+                    for service in reaction_services:
+                        # Try to detect emoji from name
+                        for emoji in ["👍", "❤️", "🔥", "😊", "😢", "😮", "😡"]:
+                            if emoji in service['name']:
+                                reaction_mapping[f"reaction_{emoji}"] = service['service']
 
-                if repost_service:
+                    if reaction_mapping:
+                        await channel_repo.update_service_ids(
+                            channel.id,
+                            "reactions",
+                            reaction_mapping
+                        )
+
+                # For reposts
+                if repost_services:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "reposts",
-                        {"reposts": repost_service}
+                        {"reposts": repost_services[0]['service']}
                     )
 
             self.task_stats[task_name]["runs"] += 1
