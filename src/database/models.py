@@ -3,7 +3,7 @@ Database models and enums
 """
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Union
 from datetime import datetime
 
 
@@ -31,6 +31,12 @@ class ServiceType(str, Enum):
     VIEWS = "views"
     REACTIONS = "reactions"
     REPOSTS = "reposts"
+
+
+class APIProvider(str, Enum):
+    """API provider for orders"""
+    TWIBOOST = "twiboost"
+    NAKRUTOCHKA = "nakrutochka"
 
 
 @dataclass
@@ -77,8 +83,12 @@ class ChannelSettings:
     # Repost specific
     repost_delay_minutes: int = 5
 
-    # Twiboost service mappings
+    # Service mappings for both APIs
     twiboost_service_ids: Optional[Dict[str, int]] = None  # {"service_name": service_id}
+    nakrutochka_service_ids: Optional[Dict[str, int]] = None  # {"service_name": service_id}
+
+    # API preferences
+    api_preferences: Optional[Dict[str, str]] = None  # {"views": "twiboost", "reactions": "nakrutochka"}
 
     # Drip-feed settings
     drops_per_run: int = 5  # количество за один запуск
@@ -119,6 +129,23 @@ class ChannelSettings:
 
         return result
 
+    def get_api_provider(self, service_type: ServiceType) -> APIProvider:
+        """Get preferred API provider for service type"""
+        if self.api_preferences:
+            provider = self.api_preferences.get(service_type)
+            if provider:
+                return APIProvider(provider)
+
+        # Defaults
+        if service_type == ServiceType.VIEWS:
+            return APIProvider.TWIBOOST
+        elif service_type == ServiceType.REACTIONS:
+            return APIProvider.NAKRUTOCHKA
+        elif service_type == ServiceType.REPOSTS:
+            return APIProvider.NAKRUTOCHKA
+
+        return APIProvider.TWIBOOST
+
 
 @dataclass
 class Post:
@@ -130,19 +157,16 @@ class Post:
     status: PostStatus = PostStatus.NEW
     detected_at: datetime = None
     processed_at: Optional[datetime] = None
-    channel_username: Optional[str] = None  # ДОДАНО: username каналу
+    channel_username: Optional[str] = None
 
     @property
     def link(self) -> str:
         """Generate Telegram link to post"""
-        # ВИПРАВЛЕНО: Використовуємо правильний формат посилань
-
         # Якщо є username - використовуємо публічне посилання
         if self.channel_username:
             return f"https://t.me/{self.channel_username}/{self.message_id}"
 
         # Для приватних каналів використовуємо формат /c/
-        # Видаляємо -100 префікс для приватних каналів
         channel_str = str(abs(self.channel_id))
         if len(channel_str) > 10:  # Private channel має префікс -100
             channel_str = channel_str[3:]  # Видаляємо перші 3 символи (100)
@@ -155,9 +179,14 @@ class Order:
     """SMM order model"""
     id: Optional[int]
     post_id: int
-    twiboost_order_id: Optional[int]
+
+    # Support for both APIs
+    twiboost_order_id: Optional[int] = None
+    nakrutochka_order_id: Optional[Union[int, str]] = None
+    api_provider: APIProvider = APIProvider.TWIBOOST
+
     service_type: ServiceType
-    service_id: int  # Twiboost service ID
+    service_id: int  # Service ID in respective API
 
     # Quantities
     quantity: int  # Original requested
@@ -190,6 +219,8 @@ class Order:
             "id": self.id,
             "post_id": self.post_id,
             "twiboost_order_id": self.twiboost_order_id,
+            "nakrutochka_order_id": self.nakrutochka_order_id,
+            "api_provider": self.api_provider,
             "service_type": self.service_type,
             "service_id": self.service_id,
             "quantity": self.quantity,
@@ -205,6 +236,14 @@ class Order:
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "error_message": self.error_message
         }
+
+    def get_external_order_id(self) -> Optional[Union[int, str]]:
+        """Get order ID from the API that was used"""
+        if self.api_provider == APIProvider.TWIBOOST:
+            return self.twiboost_order_id
+        elif self.api_provider == APIProvider.NAKRUTOCHKA:
+            return self.nakrutochka_order_id
+        return None
 
 
 @dataclass
@@ -252,4 +291,35 @@ class TwiboostService:
             max_quantity=data["max"],
             refill=data.get("refill", False),
             cancel=data.get("cancel", False)
+        )
+
+
+@dataclass
+class NakrutochkaService:
+    """Nakrutochka service mapping"""
+    service_id: int
+    name: str
+    type: str  # 'reactions', 'reposts'
+    category: str
+    rate: float
+    min_quantity: int
+    max_quantity: int
+    refill: bool
+    cancel: bool
+    emoji: Optional[str] = None  # For reaction services
+
+    @classmethod
+    def from_api(cls, data: Dict[str, Any]) -> "NakrutochkaService":
+        """Create from API response"""
+        return cls(
+            service_id=data["service"],
+            name=data["name"],
+            type=data.get("parsed_type", "other"),
+            category=data.get("category", ""),
+            rate=float(data["rate"]),
+            min_quantity=data["min"],
+            max_quantity=data["max"],
+            refill=data.get("refill", False),
+            cancel=data.get("cancel", False),
+            emoji=data.get("emoji")
         )

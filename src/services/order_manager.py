@@ -1,14 +1,15 @@
 """
-Order manager - handles order execution and status tracking
+Order manager - handles order execution and status tracking for both APIs
 """
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from datetime import datetime, timedelta
 
-from src.database.models import Order, OrderStatus, Post
+from src.database.models import Order, OrderStatus, Post, APIProvider
 from src.database.repositories.order_repo import order_repo
 from src.database.repositories.post_repo import post_repo
 from src.services.twiboost_client import twiboost_client, TwiboostAPIError
+from src.services.nakrutochka_client import nakrutochka_client, NakrutochkaAPIError
 from src.utils.logger import get_logger, LoggerMixin, metrics
 from src.config import settings
 
@@ -17,11 +18,11 @@ logger = get_logger(__name__)
 
 
 class OrderManager(LoggerMixin):
-    """Manages order execution and status tracking"""
+    """Manages order execution and status tracking for both APIs"""
 
     def __init__(self):
         self.execution_lock = asyncio.Lock()
-        self.active_orders = {}
+        self.active_orders = {}  # {order_id: (api_provider, external_order_id)}
         self.execution_count = 0
         self.error_count = 0
 
@@ -65,13 +66,14 @@ class OrderManager(LoggerMixin):
                 return 0
 
     async def _execute_single_order(self, order: Order) -> bool:
-        """Execute single order"""
+        """Execute single order through appropriate API"""
         try:
             self.log_info(
                 "Executing order",
                 order_id=order.id,
                 service_type=order.service_type,
-                quantity=order.actual_quantity
+                quantity=order.actual_quantity,
+                api_provider=order.api_provider
             )
 
             # Get post for link
@@ -85,38 +87,32 @@ class OrderManager(LoggerMixin):
                 OrderStatus.IN_PROGRESS
             )
 
-            # Prepare parameters for Twiboost
-            if order.runs and order.interval:
-                # Drip-feed order
-                twiboost_order_id = await twiboost_client.create_order(
-                    service_id=order.service_id,
-                    link=post.link,
-                    quantity=order.actual_quantity,
-                    runs=order.runs,
-                    interval=order.interval
+            # Execute through appropriate API
+            if order.api_provider == APIProvider.TWIBOOST:
+                external_order_id = await self._execute_twiboost_order(order, post)
+                await order_repo.update_order_status(
+                    order.id,
+                    OrderStatus.IN_PROGRESS,
+                    twiboost_order_id=external_order_id
+                )
+            elif order.api_provider == APIProvider.NAKRUTOCHKA:
+                external_order_id = await self._execute_nakrutochka_order(order, post)
+                await order_repo.update_order_status(
+                    order.id,
+                    OrderStatus.IN_PROGRESS,
+                    nakrutochka_order_id=external_order_id
                 )
             else:
-                # Regular order
-                twiboost_order_id = await twiboost_client.create_order(
-                    service_id=order.service_id,
-                    link=post.link,
-                    quantity=order.actual_quantity
-                )
-
-            # Update order with Twiboost ID
-            await order_repo.update_order_status(
-                order.id,
-                OrderStatus.IN_PROGRESS,
-                twiboost_order_id=twiboost_order_id
-            )
+                raise ValueError(f"Unknown API provider: {order.api_provider}")
 
             # Track active order
-            self.active_orders[order.id] = twiboost_order_id
+            self.active_orders[order.id] = (order.api_provider, external_order_id)
 
             self.log_info(
                 "Order executed successfully",
                 order_id=order.id,
-                twiboost_id=twiboost_order_id
+                api_provider=order.api_provider,
+                external_order_id=external_order_id
             )
 
             self.execution_count += 1
@@ -131,23 +127,31 @@ class OrderManager(LoggerMixin):
 
             return True
 
-        except TwiboostAPIError as e:
+        except (TwiboostAPIError, NakrutochkaAPIError) as e:
             self.log_error(
-                "Twiboost API error",
+                "API error",
                 error=e,
-                order_id=order.id
+                order_id=order.id,
+                api_provider=order.api_provider
             )
 
             # Update retry count
             retry_count = await order_repo.increment_retry_count(order.id)
 
             if retry_count >= settings.max_retries:
-                # Max retries reached, mark as failed
-                await order_repo.update_order_status(
-                    order.id,
-                    OrderStatus.FAILED,
-                    error_message=str(e)
-                )
+                # Try fallback API if enabled
+                if settings.enable_api_fallback and not order.get("fallback_attempted"):
+                    self.log_info(
+                        f"Attempting fallback to other API for order {order.id}"
+                    )
+                    await self._attempt_fallback(order, post)
+                else:
+                    # Max retries reached, mark as failed
+                    await order_repo.update_order_status(
+                        order.id,
+                        OrderStatus.FAILED,
+                        error_message=str(e)
+                    )
             else:
                 # Reset to pending for retry
                 await order_repo.update_order_status(
@@ -176,8 +180,111 @@ class OrderManager(LoggerMixin):
             self.error_count += 1
             return False
 
+    async def _execute_twiboost_order(self, order: Order, post: Post) -> int:
+        """Execute order through Twiboost API"""
+        if order.runs and order.interval:
+            # Drip-feed order
+            return await twiboost_client.create_order(
+                service_id=order.service_id,
+                link=post.link,
+                quantity=order.actual_quantity,
+                runs=order.runs,
+                interval=order.interval
+            )
+        else:
+            # Regular order
+            return await twiboost_client.create_order(
+                service_id=order.service_id,
+                link=post.link,
+                quantity=order.actual_quantity
+            )
+
+    async def _execute_nakrutochka_order(self, order: Order, post: Post) -> Union[int, str]:
+        """Execute order through Nakrutochka API"""
+        if order.runs and order.interval:
+            # Drip-feed order
+            return await nakrutochka_client.create_order(
+                service_id=order.service_id,
+                link=post.link,
+                quantity=order.actual_quantity,
+                runs=order.runs,
+                interval=order.interval
+            )
+        else:
+            # Regular order
+            return await nakrutochka_client.create_order(
+                service_id=order.service_id,
+                link=post.link,
+                quantity=order.actual_quantity
+            )
+
+    async def _attempt_fallback(self, order: Order, post: Post):
+        """Attempt to execute order through fallback API"""
+        try:
+            # Determine fallback API
+            fallback_api = (
+                APIProvider.NAKRUTOCHKA
+                if order.api_provider == APIProvider.TWIBOOST
+                else APIProvider.TWIBOOST
+            )
+
+            self.log_info(
+                f"Attempting fallback from {order.api_provider} to {fallback_api}",
+                order_id=order.id
+            )
+
+            # Find equivalent service in fallback API
+            from src.database.repositories.service_repo import service_repo
+            service_info = await service_repo.get_service_for_order(
+                service_type=order.service_type,
+                quantity=order.actual_quantity,
+                api_provider=fallback_api,
+                emoji=order.reaction_emoji
+            )
+
+            if not service_info:
+                self.log_error(
+                    f"No fallback service found in {fallback_api}",
+                    order_id=order.id
+                )
+                await order_repo.update_order_status(
+                    order.id,
+                    OrderStatus.FAILED,
+                    error_message="No fallback service available"
+                )
+                return
+
+            # Update order with new API and service
+            await order_repo.update_order_api_provider(
+                order.id,
+                fallback_api,
+                service_info["service_id"]
+            )
+
+            # Mark fallback attempted
+            await order_repo.mark_fallback_attempted(order.id)
+
+            # Reset to pending for execution with new API
+            await order_repo.update_order_status(
+                order.id,
+                OrderStatus.PENDING,
+                error_message=f"Fallback to {fallback_api}"
+            )
+
+        except Exception as e:
+            self.log_error(
+                "Fallback attempt failed",
+                error=e,
+                order_id=order.id
+            )
+            await order_repo.update_order_status(
+                order.id,
+                OrderStatus.FAILED,
+                error_message=f"Fallback failed: {str(e)}"
+            )
+
     async def check_orders_status(self, limit: int = 50) -> int:
-        """Check status of active orders from Twiboost"""
+        """Check status of active orders from both APIs"""
         try:
             # Get orders to check
             orders = await order_repo.get_orders_to_check_status(limit)
@@ -188,44 +295,25 @@ class OrderManager(LoggerMixin):
 
             self.log_debug(f"Checking status for {len(orders)} orders")
 
-            # Group orders by Twiboost ID for batch check
-            twiboost_ids = [o.twiboost_order_id for o in orders if o.twiboost_order_id]
+            # Separate orders by API
+            twiboost_orders = []
+            nakrutochka_orders = []
 
-            if not twiboost_ids:
-                return 0
-
-            # Get statuses from Twiboost
-            statuses = await twiboost_client.get_multiple_orders_status(twiboost_ids)
-
-            # Update orders based on status
-            updated = 0
             for order in orders:
-                if order.twiboost_order_id in statuses:
-                    status_data = statuses[order.twiboost_order_id]
+                if order.api_provider == APIProvider.TWIBOOST and order.twiboost_order_id:
+                    twiboost_orders.append(order)
+                elif order.api_provider == APIProvider.NAKRUTOCHKA and order.nakrutochka_order_id:
+                    nakrutochka_orders.append(order)
 
-                    if isinstance(status_data, dict):
-                        # Map Twiboost status to our status
-                        new_status = self._map_twiboost_status(status_data.get("status"))
+            updated = 0
 
-                        if new_status != order.status:
-                            await order_repo.update_order_status(
-                                order.id,
-                                new_status,
-                                response_data=status_data
-                            )
+            # Check Twiboost orders
+            if twiboost_orders:
+                updated += await self._check_twiboost_statuses(twiboost_orders)
 
-                            # Remove from active if completed
-                            if new_status in [OrderStatus.COMPLETED, OrderStatus.FAILED, OrderStatus.CANCELED]:
-                                self.active_orders.pop(order.id, None)
-
-                            updated += 1
-
-                            self.log_info(
-                                "Order status updated",
-                                order_id=order.id,
-                                old_status=order.status,
-                                new_status=new_status
-                            )
+            # Check Nakrutochka orders
+            if nakrutochka_orders:
+                updated += await self._check_nakrutochka_statuses(nakrutochka_orders)
 
             self.log_info(f"Updated {updated} order statuses")
             return updated
@@ -233,6 +321,88 @@ class OrderManager(LoggerMixin):
         except Exception as e:
             self.log_error("Status check failed", error=e)
             return 0
+
+    async def _check_twiboost_statuses(self, orders: List[Order]) -> int:
+        """Check statuses for Twiboost orders"""
+        twiboost_ids = [o.twiboost_order_id for o in orders]
+
+        try:
+            statuses = await twiboost_client.get_multiple_orders_status(twiboost_ids)
+        except Exception as e:
+            self.log_error(f"Failed to get Twiboost statuses: {e}")
+            return 0
+
+        updated = 0
+        for order in orders:
+            if order.twiboost_order_id in statuses:
+                status_data = statuses[order.twiboost_order_id]
+
+                if isinstance(status_data, dict):
+                    new_status = self._map_twiboost_status(status_data.get("status"))
+
+                    if new_status != order.status:
+                        await order_repo.update_order_status(
+                            order.id,
+                            new_status,
+                            response_data=status_data
+                        )
+
+                        # Remove from active if completed
+                        if new_status in [OrderStatus.COMPLETED, OrderStatus.FAILED, OrderStatus.CANCELED]:
+                            self.active_orders.pop(order.id, None)
+
+                        updated += 1
+
+                        self.log_info(
+                            "Twiboost order status updated",
+                            order_id=order.id,
+                            old_status=order.status,
+                            new_status=new_status
+                        )
+
+        return updated
+
+    async def _check_nakrutochka_statuses(self, orders: List[Order]) -> int:
+        """Check statuses for Nakrutochka orders"""
+        nakrutochka_ids = [o.nakrutochka_order_id for o in orders]
+
+        try:
+            statuses = await nakrutochka_client.get_multiple_orders_status(nakrutochka_ids)
+        except Exception as e:
+            self.log_error(f"Failed to get Nakrutochka statuses: {e}")
+            return 0
+
+        updated = 0
+        for order in orders:
+            if order.nakrutochka_order_id in statuses:
+                status_data = statuses[order.nakrutochka_order_id]
+
+                if isinstance(status_data, dict):
+                    new_status = nakrutochka_client.map_status_to_order_status(
+                        status_data.get("status")
+                    )
+
+                    if new_status != order.status:
+                        await order_repo.update_order_status(
+                            order.id,
+                            new_status,
+                            response_data=status_data
+                        )
+
+                        # Remove from active if completed
+                        if new_status in [OrderStatus.COMPLETED, OrderStatus.FAILED, OrderStatus.CANCELED]:
+                            self.active_orders.pop(order.id, None)
+
+                        updated += 1
+
+                        self.log_info(
+                            "Nakrutochka order status updated",
+                            order_id=order.id,
+                            old_status=order.status,
+                            new_status=new_status
+                        )
+
+        return updated
 
     def _map_twiboost_status(self, twiboost_status: str) -> OrderStatus:
         """Map Twiboost status to our OrderStatus"""
@@ -248,7 +418,7 @@ class OrderManager(LoggerMixin):
         return mapping.get(twiboost_status, OrderStatus.FAILED)
 
     async def cancel_order(self, order_id: int) -> bool:
-        """Cancel order"""
+        """Cancel order in appropriate API"""
         try:
             order = await order_repo.get_order(order_id)
 
@@ -256,26 +426,29 @@ class OrderManager(LoggerMixin):
                 self.log_error("Order not found", order_id=order_id)
                 return False
 
-            if not order.twiboost_order_id:
-                # Order not sent to Twiboost yet
-                await order_repo.update_order_status(
-                    order_id,
-                    OrderStatus.CANCELED
-                )
-                return True
+            # Determine which API to use
+            if order.api_provider == APIProvider.TWIBOOST:
+                if not order.twiboost_order_id:
+                    await order_repo.update_order_status(order_id, OrderStatus.CANCELED)
+                    return True
 
-            # Cancel in Twiboost
-            success = await twiboost_client.cancel_order(order.twiboost_order_id)
+                success = await twiboost_client.cancel_order(order.twiboost_order_id)
+
+            elif order.api_provider == APIProvider.NAKRUTOCHKA:
+                if not order.nakrutochka_order_id:
+                    await order_repo.update_order_status(order_id, OrderStatus.CANCELED)
+                    return True
+
+                result = await nakrutochka_client.cancel_orders([order.nakrutochka_order_id])
+                success = bool(result)
+
+            else:
+                self.log_error(f"Unknown API provider: {order.api_provider}")
+                return False
 
             if success:
-                await order_repo.update_order_status(
-                    order_id,
-                    OrderStatus.CANCELED
-                )
-
-                # Remove from active orders
+                await order_repo.update_order_status(order_id, OrderStatus.CANCELED)
                 self.active_orders.pop(order_id, None)
-
                 self.log_info("Order canceled", order_id=order_id)
                 return True
             else:
@@ -325,8 +498,12 @@ class OrderManager(LoggerMixin):
             return 0
 
     async def get_execution_stats(self) -> Dict[str, Any]:
-        """Get execution statistics"""
+        """Get execution statistics for both APIs"""
         stats = await order_repo.get_statistics()
+
+        # Add API-specific stats
+        api_stats = await order_repo.get_statistics_by_api()
+        stats["by_api"] = api_stats
 
         stats.update({
             "session_executed": self.execution_count,
@@ -355,6 +532,24 @@ class OrderManager(LoggerMixin):
 
         self.log_info(f"Cleaned up {count} completed orders")
         return count
+
+    async def get_api_balances(self) -> Dict[str, Dict[str, Any]]:
+        """Get balances from both APIs"""
+        balances = {}
+
+        try:
+            balances["twiboost"] = await twiboost_client.get_balance()
+        except Exception as e:
+            self.log_error(f"Failed to get Twiboost balance: {e}")
+            balances["twiboost"] = {"balance": 0, "currency": "N/A", "error": str(e)}
+
+        try:
+            balances["nakrutochka"] = await nakrutochka_client.get_balance()
+        except Exception as e:
+            self.log_error(f"Failed to get Nakrutochka balance: {e}")
+            balances["nakrutochka"] = {"balance": 0, "currency": "N/A", "error": str(e)}
+
+        return balances
 
 
 # Import db after class definition

@@ -29,6 +29,47 @@ class Settings(BaseSettings):
     )
     twiboost_api_key: str = Field(..., env="TWIBOOST_API_KEY")
 
+    # Nakrutochka API
+    nakrutochka_api_url: str = Field(
+        default="https://nakrutochka.com/api/v2",
+        env="NAKRUTOCHKA_API_URL"
+    )
+    nakrutochka_api_key: str = Field(..., env="NAKRUTOCHKA_API_KEY")
+
+    # API Usage Preferences
+    use_nakrutochka_for_reactions: bool = Field(
+        default=True,
+        env="USE_NAKRUTOCHKA_FOR_REACTIONS"
+    )
+    use_nakrutochka_for_reposts: bool = Field(
+        default=True,
+        env="USE_NAKRUTOCHKA_FOR_REPOSTS"
+    )
+    use_twiboost_for_views: bool = Field(
+        default=True,
+        env="USE_TWIBOOST_FOR_VIEWS"
+    )
+
+    # Fallback settings
+    enable_api_fallback: bool = Field(
+        default=True,
+        env="ENABLE_API_FALLBACK"
+    )
+
+    # API Priority (which API to try first)
+    api_priority_reactions: str = Field(
+        default="nakrutochka",  # "nakrutochka" or "twiboost"
+        env="API_PRIORITY_REACTIONS"
+    )
+    api_priority_reposts: str = Field(
+        default="nakrutochka",
+        env="API_PRIORITY_REPOSTS"
+    )
+    api_priority_views: str = Field(
+        default="twiboost",
+        env="API_PRIORITY_VIEWS"
+    )
+
     # Monitoring intervals (seconds)
     check_interval: int = Field(default=30, env="CHECK_INTERVAL")
     process_interval: int = Field(default=10, env="PROCESS_INTERVAL")
@@ -61,7 +102,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-# Service IDs mapping (will be synced from API)
+# Service IDs mapping (will be synced from APIs)
 SERVICE_TYPES = {
     "views": "view",
     "reactions": "reaction",
@@ -78,3 +119,19 @@ DEFAULT_REACTIONS = {
     "❤️": 30,
     "🔥": 25
 }
+
+# Extended emoji support for Nakrutochka
+NAKRUTOCHKA_REACTIONS = {
+    "👍": 30,  # Like
+    "❤️": 25,  # Love
+    "🔥": 15,  # Fire
+    "😊": 10,  # Happy
+    "😮": 8,   # Wow
+    "😢": 7,   # Sad
+    "😡": 5    # Angry
+}
+
+# API Provider enum
+class APIProvider:
+    TWIBOOST = "twiboost"
+    NAKRUTOCHKA = "nakrutochka"

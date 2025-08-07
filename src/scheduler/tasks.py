@@ -1,5 +1,5 @@
 """
-Scheduler for periodic tasks
+Scheduler for periodic tasks with dual API support
 """
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -11,6 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 from src.core.post_processor import post_processor
 from src.services.order_manager import order_manager
 from src.services.twiboost_client import twiboost_client
+from src.services.nakrutochka_client import nakrutochka_client
 from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
 from src.database.repositories.service_repo import service_repo
@@ -23,18 +24,19 @@ logger = get_logger(__name__)
 
 
 class TaskScheduler(LoggerMixin):
-    """Manages scheduled tasks"""
+    """Manages scheduled tasks with dual API support"""
 
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
         self.tasks_running = False
-        self._process_posts_running = False  # ДОДАНО: Flag for preventing duplicate processing
+        self._process_posts_running = False
         self.task_stats = {
             "process_posts": {"runs": 0, "errors": 0},
             "execute_orders": {"runs": 0, "errors": 0},
             "check_statuses": {"runs": 0, "errors": 0},
             "sync_services": {"runs": 0, "errors": 0},
-            "cleanup": {"runs": 0, "errors": 0}
+            "cleanup": {"runs": 0, "errors": 0},
+            "api_health": {"runs": 0, "errors": 0}
         }
 
     async def start(self):
@@ -67,12 +69,20 @@ class TaskScheduler(LoggerMixin):
                 misfire_grace_time=60
             )
 
-            # Sync Twiboost services every hour
+            # Sync services from both APIs every hour
             self.scheduler.add_job(
                 self._sync_services_task,
                 IntervalTrigger(hours=1),
                 id="sync_services",
-                name="Sync Twiboost services"
+                name="Sync API services"
+            )
+
+            # Check API health every 5 minutes
+            self.scheduler.add_job(
+                self._api_health_check_task,
+                IntervalTrigger(minutes=5),
+                id="api_health",
+                name="API health check"
             )
 
             # Retry failed orders every 5 minutes
@@ -104,7 +114,7 @@ class TaskScheduler(LoggerMixin):
             self.tasks_running = True
 
             self.log_info(
-                "Scheduler started",
+                "Scheduler started with dual API support",
                 jobs_count=len(self.scheduler.get_jobs())
             )
 
@@ -123,7 +133,7 @@ class TaskScheduler(LoggerMixin):
         """Task: Process new posts with duplicate prevention"""
         task_name = "process_posts"
 
-        # ДОДАНО: Check if already running
+        # Check if already running
         if self._process_posts_running:
             self.log_debug(f"Task {task_name} already running, skipping")
             return
@@ -132,12 +142,12 @@ class TaskScheduler(LoggerMixin):
             self._process_posts_running = True
             self.log_debug(f"Running task: {task_name}")
 
-            # ДОДАНО: Reset stuck posts first
+            # Reset stuck posts first
             stuck_count = await post_repo.reset_stuck_processing(minutes=30)
             if stuck_count > 0:
                 self.log_info(f"Reset {stuck_count} stuck posts before processing")
 
-            # ДОДАНО: Check how many unprocessed posts
+            # Check how many unprocessed posts
             unprocessed = await post_repo.get_unprocessed_posts_count()
             if unprocessed > 0:
                 self.log_info(f"Found {unprocessed} unprocessed posts total")
@@ -153,7 +163,7 @@ class TaskScheduler(LoggerMixin):
                     total_unprocessed_remaining=unprocessed - result
                 )
 
-            # ДОДАНО: Cleanup duplicates every 100 runs
+            # Cleanup duplicates every 100 runs
             if self.task_stats[task_name]["runs"] % 100 == 0:
                 duplicates = await order_repo.cleanup_duplicate_orders()
                 if duplicates > 0:
@@ -183,7 +193,7 @@ class TaskScheduler(LoggerMixin):
             self.log_error(f"Task {task_name} failed", error=e)
 
     async def _check_statuses_task(self):
-        """Task: Check order statuses"""
+        """Task: Check order statuses from both APIs"""
         task_name = "check_statuses"
         try:
             self.log_debug(f"Running task: {task_name}")
@@ -200,31 +210,53 @@ class TaskScheduler(LoggerMixin):
             self.log_error(f"Task {task_name} failed", error=e)
 
     async def _sync_services_task(self):
-        """Task: Sync Twiboost services"""
+        """Task: Sync services from both APIs"""
         task_name = "sync_services"
         try:
             self.log_info(f"Running task: {task_name}")
 
-            # 1. Get services from API
-            services = await twiboost_client.get_services(force_refresh=True)
+            # 1. Sync Twiboost services
+            self.log_info("Syncing Twiboost services...")
+            try:
+                twiboost_services = await twiboost_client.get_services(force_refresh=True)
+                twiboost_synced = await service_repo.sync_twiboost_services(twiboost_services)
+                self.log_info(f"Synced {twiboost_synced} Twiboost services")
+            except Exception as e:
+                self.log_error(f"Failed to sync Twiboost services: {e}")
 
-            # 2. ВАЖЛИВО! Save all services to DB with their original IDs
-            synced_count = await service_repo.sync_services(services)
+            # 2. Sync Nakrutochka services
+            self.log_info("Syncing Nakrutochka services...")
+            try:
+                nakrutochka_services = await nakrutochka_client.get_services(force_refresh=True)
+                nakrutochka_synced = await service_repo.sync_nakrutochka_services(nakrutochka_services)
+                self.log_info(f"Synced {nakrutochka_synced} Nakrutochka services")
+            except Exception as e:
+                self.log_error(f"Failed to sync Nakrutochka services: {e}")
 
-            self.log_info(f"Synced {synced_count} Telegram services to database")
+            # 3. Get service counts
+            service_counts = await service_repo.get_all_active_services_count()
 
-            # 3. Get services from DB for channel updates
-            view_services = await service_repo.get_services_by_type("views")
-            reaction_mapping = await service_repo.get_reaction_services()
-            repost_services = await service_repo.get_services_by_type("reposts")
+            self.log_info(
+                "Services synced",
+                twiboost=service_counts.get("twiboost", {}),
+                nakrutochka=service_counts.get("nakrutochka", {})
+            )
 
-            # 4. Update service_ids for all channels
+            # 4. Update channel mappings
             channels = await channel_repo.get_active_channels()
 
             for channel in channels:
-                # Update views
+                # Set API preferences
+                api_preferences = {
+                    "views": "twiboost",
+                    "reactions": "nakrutochka",
+                    "reposts": "nakrutochka"
+                }
+                await channel_repo.update_api_preferences(channel.id, api_preferences)
+
+                # Update service mappings for Twiboost (views)
+                view_services = await service_repo.get_services_by_type("views")
                 if view_services:
-                    # Find optimal service (e.g., with "10 в минуту")
                     best_view = None
                     for service in view_services:
                         if '10 в минуту' in service.name or '10 в мин' in service.name:
@@ -237,49 +269,86 @@ class TaskScheduler(LoggerMixin):
                     await channel_repo.update_service_ids(
                         channel.id,
                         "views",
-                        {"views": best_view}
+                        {"views": best_view},
+                        api_provider="twiboost"
                     )
 
-                    self.log_debug(
-                        f"Channel {channel.id}: views service set to {best_view}"
-                    )
-
-                # Update reactions
+                # Update service mappings for Nakrutochka (reactions)
+                reaction_mapping = await service_repo.get_nakrutochka_reaction_services()
                 if reaction_mapping:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "reactions",
-                        reaction_mapping
+                        reaction_mapping,
+                        api_provider="nakrutochka"
                     )
 
-                    self.log_debug(
-                        f"Channel {channel.id}: reaction services mapped",
-                        mapping=reaction_mapping
-                    )
-
-                # Update reposts
+                # Update service mappings for Nakrutochka (reposts)
+                repost_services = await service_repo.get_nakrutochka_services_by_type("reposts")
                 if repost_services:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "reposts",
-                        {"reposts": repost_services[0].service_id}
+                        {"reposts": repost_services[0].service_id},
+                        api_provider="nakrutochka"
                     )
 
-                    self.log_debug(
-                        f"Channel {channel.id}: repost service set to {repost_services[0].service_id}"
-                    )
+                self.log_debug(f"Updated mappings for channel {channel.title}")
 
-            # ДОДАНО: Ensure all channels have usernames
+            # 5. Get API balances
+            balances = await order_manager.get_api_balances()
+
+            self.log_info(
+                "API Balances",
+                twiboost=f"{balances['twiboost'].get('balance', 0)} {balances['twiboost'].get('currency', 'USD')}",
+                nakrutochka=f"{balances['nakrutochka'].get('balance', 0)} {balances['nakrutochka'].get('currency', 'RUB')}"
+            )
+
+            # 6. Ensure all channels have usernames
             await channel_repo.ensure_all_usernames()
 
             self.task_stats[task_name]["runs"] += 1
 
-            self.log_info(
-                "Service sync completed",
-                total_services=len(services),
-                synced_to_db=synced_count,
-                channels_updated=len(channels)
-            )
+        except Exception as e:
+            self.task_stats[task_name]["errors"] += 1
+            self.log_error(f"Task {task_name} failed", error=e)
+
+    async def _api_health_check_task(self):
+        """Task: Check API health and availability"""
+        task_name = "api_health"
+        try:
+            self.log_debug(f"Running task: {task_name}")
+
+            health_status = {
+                "twiboost": False,
+                "nakrutochka": False
+            }
+
+            # Check Twiboost
+            try:
+                balance = await twiboost_client.get_balance()
+                health_status["twiboost"] = True
+                self.log_debug(f"Twiboost health: OK, balance: {balance['balance']}")
+            except Exception as e:
+                self.log_warning(f"Twiboost health check failed: {e}")
+
+            # Check Nakrutochka
+            try:
+                balance = await nakrutochka_client.get_balance()
+                health_status["nakrutochka"] = True
+                self.log_debug(f"Nakrutochka health: OK, balance: {balance['balance']}")
+            except Exception as e:
+                self.log_warning(f"Nakrutochka health check failed: {e}")
+
+            # Update API availability in settings if needed
+            if not health_status["twiboost"] and health_status["nakrutochka"]:
+                self.log_warning("Twiboost unavailable, using Nakrutochka for all services")
+            elif health_status["twiboost"] and not health_status["nakrutochka"]:
+                self.log_warning("Nakrutochka unavailable, using Twiboost for all services")
+            elif not health_status["twiboost"] and not health_status["nakrutochka"]:
+                self.log_error("Both APIs unavailable!")
+
+            self.task_stats[task_name]["runs"] += 1
 
         except Exception as e:
             self.task_stats[task_name]["errors"] += 1
@@ -318,7 +387,7 @@ class TaskScheduler(LoggerMixin):
             # Clean old orders (7 days)
             orders_deleted = await order_manager.cleanup_completed_orders(days=7)
 
-            # ДОДАНО: Clean duplicate orders
+            # Clean duplicate orders
             duplicates_deleted = await order_repo.cleanup_duplicate_orders()
 
             self.task_stats[task_name]["runs"] += 1
@@ -342,9 +411,10 @@ class TaskScheduler(LoggerMixin):
             # Get statistics
             post_stats = await post_processor.get_processing_stats()
             order_stats = await order_manager.get_execution_stats()
+            api_stats = await order_repo.get_statistics_by_api()
 
-            # Get balance
-            balance = await twiboost_client.get_balance()
+            # Get balances
+            balances = await order_manager.get_api_balances()
 
             # Log comprehensive stats
             self.log_info(
@@ -355,8 +425,9 @@ class TaskScheduler(LoggerMixin):
                 orders_executed=order_stats.get("total_orders", 0),
                 orders_success_rate=order_stats.get("success_rate", 0),
                 active_orders=order_stats.get("active_orders", 0),
-                balance=balance.get("balance"),
-                currency=balance.get("currency"),
+                twiboost_balance=f"{balances['twiboost'].get('balance', 0)} {balances['twiboost'].get('currency', 'USD')}",
+                nakrutochka_balance=f"{balances['nakrutochka'].get('balance', 0)} {balances['nakrutochka'].get('currency', 'RUB')}",
+                api_distribution=api_stats,
                 task_stats=self.task_stats
             )
 
@@ -408,6 +479,20 @@ class TaskScheduler(LoggerMixin):
             self.log_info(f"Resumed job: {job_id}")
             return True
         return False
+
+    def get_task_statistics(self) -> Dict[str, Any]:
+        """Get detailed task statistics"""
+        total_runs = sum(stats["runs"] for stats in self.task_stats.values())
+        total_errors = sum(stats["errors"] for stats in self.task_stats.values())
+
+        return {
+            "total_runs": total_runs,
+            "total_errors": total_errors,
+            "error_rate": (total_errors / total_runs * 100) if total_runs > 0 else 0,
+            "by_task": self.task_stats,
+            "scheduler_running": self.scheduler.running,
+            "jobs_count": len(self.scheduler.get_jobs())
+        }
 
 
 # Global scheduler instance

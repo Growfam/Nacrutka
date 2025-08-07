@@ -1,19 +1,19 @@
 """
-Channel repository for database operations
+Channel repository for database operations with dual API support
 """
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
 
 from src.database.connection import db
-from src.database.models import Channel, ChannelSettings, ServiceType
+from src.database.models import Channel, ChannelSettings, ServiceType, APIProvider
 from src.utils.logger import get_logger, LoggerMixin
 
 logger = get_logger(__name__)
 
 
 class ChannelRepository(LoggerMixin):
-    """Repository for channel operations"""
+    """Repository for channel operations with dual API support"""
 
     async def create_channel(self, channel_data: Dict[str, Any]) -> Channel:
         """Create new channel"""
@@ -178,9 +178,10 @@ class ChannelRepository(LoggerMixin):
                 channel_id, service_type, base_quantity, randomization_percent,
                 is_enabled, portions_count, fast_delivery_percent,
                 reaction_distribution, repost_delay_minutes,
-                drops_per_run, run_interval, twiboost_service_ids
+                drops_per_run, run_interval, twiboost_service_ids,
+                nakrutochka_service_ids, api_preferences
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (channel_id, service_type) DO UPDATE SET
                 base_quantity = EXCLUDED.base_quantity,
                 randomization_percent = EXCLUDED.randomization_percent,
@@ -192,6 +193,8 @@ class ChannelRepository(LoggerMixin):
                 drops_per_run = EXCLUDED.drops_per_run,
                 run_interval = EXCLUDED.run_interval,
                 twiboost_service_ids = EXCLUDED.twiboost_service_ids,
+                nakrutochka_service_ids = EXCLUDED.nakrutochka_service_ids,
+                api_preferences = EXCLUDED.api_preferences,
                 updated_at = NOW()
             RETURNING *
         """
@@ -199,8 +202,12 @@ class ChannelRepository(LoggerMixin):
         # Convert dicts to JSON
         reaction_dist = json.dumps(settings_data.get("reaction_distribution")) if settings_data.get(
             "reaction_distribution") else None
-        service_ids = json.dumps(settings_data.get("twiboost_service_ids")) if settings_data.get(
+        twiboost_ids = json.dumps(settings_data.get("twiboost_service_ids")) if settings_data.get(
             "twiboost_service_ids") else None
+        nakrutochka_ids = json.dumps(settings_data.get("nakrutochka_service_ids")) if settings_data.get(
+            "nakrutochka_service_ids") else None
+        api_prefs = json.dumps(settings_data.get("api_preferences")) if settings_data.get(
+            "api_preferences") else None
 
         row = await db.fetchrow(
             query,
@@ -215,7 +222,9 @@ class ChannelRepository(LoggerMixin):
             settings_data.get("repost_delay_minutes", 5),
             settings_data.get("drops_per_run", 5),
             settings_data.get("run_interval", 30),
-            service_ids
+            twiboost_ids,
+            nakrutochka_ids,
+            api_prefs
         )
 
         self.log_info(
@@ -265,16 +274,76 @@ class ChannelRepository(LoggerMixin):
 
         return [self._row_to_settings(row) for row in rows]
 
-    async def update_service_ids(
-            self,
-            channel_id: int,
-            service_type: str,
-            service_ids: Dict[str, int]
-    ):
-        """Update Twiboost service IDs for channel"""
+    # ========== Dual API Support Methods ==========
+
+    async def update_api_preferences(self, channel_id: int, preferences: Dict[str, str]):
+        """Update API preferences for channel"""
         query = """
             UPDATE channel_settings
-            SET twiboost_service_ids = $3,
+            SET api_preferences = $2,
+                updated_at = NOW()
+            WHERE channel_id = $1
+        """
+
+        await db.execute(query, channel_id, json.dumps(preferences))
+
+        self.log_info(
+            "API preferences updated",
+            channel_id=channel_id,
+            preferences=preferences
+        )
+
+    async def update_api_preference(self, channel_id: int, service_type: str, api: str):
+        """Update API preference for specific service type"""
+        # Get current preferences
+        query = """
+            SELECT api_preferences FROM channel_settings
+            WHERE channel_id = $1 AND service_type = $2
+            LIMIT 1
+        """
+        row = await db.fetchrow(query, channel_id, service_type)
+
+        if row and row["api_preferences"]:
+            preferences = json.loads(row["api_preferences"])
+        else:
+            preferences = {}
+
+        preferences[service_type] = api
+
+        # Update
+        update_query = """
+            UPDATE channel_settings
+            SET api_preferences = $3,
+                updated_at = NOW()
+            WHERE channel_id = $1 AND service_type = $2
+        """
+
+        await db.execute(update_query, channel_id, service_type, json.dumps(preferences))
+
+        self.log_info(
+            f"API preference updated for {service_type}",
+            channel_id=channel_id,
+            api=api
+        )
+
+    async def update_service_ids(
+        self,
+        channel_id: int,
+        service_type: str,
+        service_ids: Dict[str, int],
+        api_provider: str = "twiboost"
+    ):
+        """Update service IDs for specific API"""
+        if api_provider == "twiboost":
+            column = "twiboost_service_ids"
+        elif api_provider == "nakrutochka":
+            column = "nakrutochka_service_ids"
+        else:
+            raise ValueError(f"Unknown API provider: {api_provider}")
+
+        query = f"""
+            UPDATE channel_settings
+            SET {column} = $3,
                 updated_at = NOW()
             WHERE channel_id = $1
               AND service_type = $2
@@ -283,14 +352,103 @@ class ChannelRepository(LoggerMixin):
         await db.execute(query, channel_id, service_type, json.dumps(service_ids))
 
         self.log_info(
-            "Service IDs updated",
+            f"{api_provider} service IDs updated",
             channel_id=channel_id,
             service_type=service_type,
             service_ids=service_ids
         )
 
+    async def get_api_preference(
+        self,
+        channel_id: int,
+        service_type: ServiceType
+    ) -> APIProvider:
+        """Get preferred API for service type"""
+        query = """
+            SELECT api_preferences
+            FROM channel_settings
+            WHERE channel_id = $1
+              AND service_type = $2
+            LIMIT 1
+        """
+
+        row = await db.fetchrow(query, channel_id, service_type)
+
+        if row and row["api_preferences"]:
+            preferences = json.loads(row["api_preferences"])
+            provider = preferences.get(service_type)
+            if provider:
+                return APIProvider(provider)
+
+        # Return defaults
+        if service_type == ServiceType.VIEWS:
+            return APIProvider.TWIBOOST
+        elif service_type == ServiceType.REACTIONS:
+            return APIProvider.NAKRUTOCHKA
+        elif service_type == ServiceType.REPOSTS:
+            return APIProvider.NAKRUTOCHKA
+
+        return APIProvider.TWIBOOST
+
+    async def get_api_preferences(self, channel_id: int) -> Dict[str, str]:
+        """Get all API preferences for channel"""
+        query = """
+            SELECT service_type, api_preferences
+            FROM channel_settings
+            WHERE channel_id = $1
+        """
+
+        rows = await db.fetch(query, channel_id)
+
+        result = {}
+        for row in rows:
+            if row["api_preferences"]:
+                prefs = json.loads(row["api_preferences"])
+                service_type = row["service_type"]
+                if service_type in prefs:
+                    result[service_type] = prefs[service_type]
+
+        # Fill defaults
+        if "views" not in result:
+            result["views"] = "twiboost"
+        if "reactions" not in result:
+            result["reactions"] = "nakrutochka"
+        if "reposts" not in result:
+            result["reposts"] = "nakrutochka"
+
+        return result
+
+    async def get_service_ids_for_api(
+        self,
+        channel_id: int,
+        service_type: str,
+        api_provider: str
+    ) -> Dict[str, int]:
+        """Get service IDs for specific API"""
+        if api_provider == "twiboost":
+            column = "twiboost_service_ids"
+        elif api_provider == "nakrutochka":
+            column = "nakrutochka_service_ids"
+        else:
+            return {}
+
+        query = f"""
+            SELECT {column}
+            FROM channel_settings
+            WHERE channel_id = $1
+              AND service_type = $2
+            LIMIT 1
+        """
+
+        row = await db.fetchrow(query, channel_id, service_type)
+
+        if row and row[column]:
+            return json.loads(row[column])
+
+        return {}
+
     async def bulk_create_default_settings(self, channel_id: int):
-        """Create default settings for all service types"""
+        """Create default settings for all service types with dual API support"""
         default_settings = [
             {
                 "channel_id": channel_id,
@@ -298,7 +456,8 @@ class ChannelRepository(LoggerMixin):
                 "base_quantity": 1000,
                 "randomization_percent": 0,
                 "portions_count": 5,
-                "fast_delivery_percent": 70
+                "fast_delivery_percent": 70,
+                "api_preferences": {"views": "twiboost"}
             },
             {
                 "channel_id": channel_id,
@@ -308,7 +467,8 @@ class ChannelRepository(LoggerMixin):
                 "reaction_distribution": {"👍": 45, "❤️": 30, "🔥": 25},
                 "portions_count": 1,
                 "drops_per_run": 5,
-                "run_interval": 23
+                "run_interval": 23,
+                "api_preferences": {"reactions": "nakrutochka"}
             },
             {
                 "channel_id": channel_id,
@@ -318,14 +478,84 @@ class ChannelRepository(LoggerMixin):
                 "portions_count": 1,
                 "repost_delay_minutes": 5,
                 "drops_per_run": 3,
-                "run_interval": 34
+                "run_interval": 34,
+                "api_preferences": {"reposts": "nakrutochka"}
             }
         ]
 
         for settings in default_settings:
             await self.create_settings(settings)
 
-        self.log_info("Default settings created", channel_id=channel_id)
+        self.log_info("Default settings created with dual API support", channel_id=channel_id)
+
+    async def migrate_to_dual_api(self):
+        """Migrate existing channels to dual API support"""
+        channels = await self.get_active_channels()
+
+        for channel in channels:
+            # Set default API preferences
+            api_preferences = {
+                "views": "twiboost",
+                "reactions": "nakrutochka",
+                "reposts": "nakrutochka"
+            }
+
+            await self.update_api_preferences(channel.id, api_preferences)
+
+            self.log_info(
+                f"Migrated channel {channel.id} to dual API support",
+                channel_id=channel.id
+            )
+
+        self.log_info(f"Migrated {len(channels)} channels to dual API support")
+
+    # ========== Statistics Methods ==========
+
+    async def get_channel_statistics(self, channel_id: int) -> Dict[str, Any]:
+        """Get detailed statistics for channel"""
+        # Get post statistics
+        post_query = """
+            SELECT 
+                COUNT(*) as total_posts,
+                COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_posts,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_posts,
+                COUNT(CASE WHEN detected_at > NOW() - INTERVAL '24 hours' THEN 1 END) as posts_24h
+            FROM posts
+            WHERE channel_id = $1
+        """
+        post_stats = await db.fetchrow(post_query, channel_id)
+
+        # Get order statistics by API
+        order_query = """
+            SELECT 
+                o.api_provider,
+                COUNT(*) as count,
+                SUM(o.actual_quantity) as total_quantity,
+                COUNT(CASE WHEN o.status = 'completed' THEN 1 END) as completed
+            FROM orders o
+            JOIN posts p ON o.post_id = p.id
+            WHERE p.channel_id = $1
+            GROUP BY o.api_provider
+        """
+        order_stats = await db.fetch(order_query, channel_id)
+
+        api_stats = {}
+        for row in order_stats:
+            api_stats[row["api_provider"]] = {
+                "count": row["count"],
+                "total_quantity": row["total_quantity"],
+                "completed": row["completed"]
+            }
+
+        return {
+            "posts": {
+                "total": post_stats["total_posts"],
+                "completed": post_stats["completed_posts"],
+                "failed": post_stats["failed_posts"],
+                "last_24h": post_stats["posts_24h"]
+            },
+            "orders_by_api": api_stats
+        }
 
     # ========== Helper Methods ==========
 
@@ -354,6 +584,8 @@ class ChannelRepository(LoggerMixin):
             reaction_distribution=json.loads(row["reaction_distribution"]) if row["reaction_distribution"] else None,
             repost_delay_minutes=row["repost_delay_minutes"],
             twiboost_service_ids=json.loads(row["twiboost_service_ids"]) if row["twiboost_service_ids"] else None,
+            nakrutochka_service_ids=json.loads(row["nakrutochka_service_ids"]) if row["nakrutochka_service_ids"] else None,
+            api_preferences=json.loads(row["api_preferences"]) if row["api_preferences"] else None,
             drops_per_run=row["drops_per_run"],
             run_interval=row["run_interval"],
             updated_at=row["updated_at"]

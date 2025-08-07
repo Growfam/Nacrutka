@@ -1,5 +1,5 @@
 """
-Post processor - creates orders for new posts
+Post processor - creates orders for new posts with dual API support
 """
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -8,7 +8,7 @@ import random
 
 from src.database.models import (
     Post, PostStatus, Order, OrderStatus,
-    ServiceType, ChannelSettings
+    ServiceType, ChannelSettings, APIProvider
 )
 from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
@@ -16,6 +16,7 @@ from src.database.repositories.order_repo import order_repo
 from src.database.repositories.service_repo import service_repo
 from src.core.portion_calculator import portion_calculator
 from src.services.twiboost_client import twiboost_client
+from src.services.nakrutochka_client import nakrutochka_client
 from src.utils.logger import get_logger, LoggerMixin, metrics
 from src.config import settings
 
@@ -23,13 +24,12 @@ logger = get_logger(__name__)
 
 
 class PostProcessor(LoggerMixin):
-    """Process new posts and create orders"""
+    """Process new posts and create orders with dual API support"""
 
     def __init__(self):
         self.processing_lock = asyncio.Lock()
         self.processed_count = 0
         self.error_count = 0
-        # ДОДАНО: Кеш для запобігання паралельній обробці
         self.processing_posts = set()
 
     async def process_new_posts(self, limit: int = 10) -> int:
@@ -48,7 +48,7 @@ class PostProcessor(LoggerMixin):
                 # Process each post
                 processed = 0
                 for post in posts:
-                    # ДОДАНО: Перевірка чи вже обробляється
+                    # Check if already being processed
                     if post.id in self.processing_posts:
                         self.log_warning(
                             f"Post {post.id} already being processed, skipping",
@@ -57,7 +57,7 @@ class PostProcessor(LoggerMixin):
                         continue
 
                     try:
-                        # Додаємо в список обробки
+                        # Add to processing set
                         self.processing_posts.add(post.id)
 
                         await self._process_single_post(post)
@@ -75,7 +75,7 @@ class PostProcessor(LoggerMixin):
                         self.error_count += 1
                         metrics.log_error_rate("post_processing", 1)
                     finally:
-                        # Видаляємо з списку обробки
+                        # Remove from processing set
                         self.processing_posts.discard(post.id)
 
                 self.log_info(
@@ -92,18 +92,16 @@ class PostProcessor(LoggerMixin):
                 return 0
 
     async def _process_single_post(self, post: Post):
-        """Process single post"""
+        """Process single post with dual API support"""
 
-        # ВАЖЛИВО: ПЕРЕВІРКА НА ІСНУЮЧІ ЗАМОВЛЕННЯ
+        # Check for existing orders
         existing_orders = await order_repo.get_orders_by_post(post.id)
         if existing_orders:
             self.log_warning(
                 f"Orders already exist for post {post.id}, marking as completed",
                 post_id=post.id,
-                existing_count=len(existing_orders),
-                existing_types=[o.service_type for o in existing_orders]
+                existing_count=len(existing_orders)
             )
-            # Помічаємо як completed якщо вже є замовлення
             await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
             return
 
@@ -129,7 +127,7 @@ class PostProcessor(LoggerMixin):
             await channel_repo.bulk_create_default_settings(post.channel_id)
             all_settings = await channel_repo.get_channel_settings(post.channel_id)
 
-        # ДОДАНО: Отримуємо інформацію про канал для username
+        # Get channel username
         channel = await channel_repo.get_channel(post.channel_id)
         if channel and channel.username:
             post.channel_username = channel.username
@@ -140,27 +138,35 @@ class PostProcessor(LoggerMixin):
 
         for settings in all_settings:
             try:
-                # ДОДАНО: Перевірка чи вже існують замовлення цього типу
+                # Check if orders of this type already exist
                 existing_type_orders = [o for o in existing_orders if o.service_type == settings.service_type]
                 if existing_type_orders:
                     self.log_warning(
                         f"Orders of type {settings.service_type} already exist for post {post.id}",
                         post_id=post.id,
-                        service_type=settings.service_type,
-                        count=len(existing_type_orders)
+                        service_type=settings.service_type
                     )
                     continue
 
+                # Determine API provider based on service type and settings
+                api_provider = self._determine_api_provider(settings.service_type, settings)
+
+                self.log_info(
+                    f"Creating {settings.service_type} orders using {api_provider}",
+                    post_id=post.id,
+                    api_provider=api_provider
+                )
+
                 if settings.service_type == ServiceType.VIEWS:
-                    orders = await self._create_view_orders(post, settings)
+                    orders = await self._create_view_orders(post, settings, api_provider)
                     orders_created.extend(orders)
 
                 elif settings.service_type == ServiceType.REACTIONS:
-                    orders = await self._create_reaction_orders(post, settings)
+                    orders = await self._create_reaction_orders(post, settings, api_provider)
                     orders_created.extend(orders)
 
                 elif settings.service_type == ServiceType.REPOSTS:
-                    orders = await self._create_repost_orders(post, settings)
+                    orders = await self._create_repost_orders(post, settings, api_provider)
                     orders_created.extend(orders)
 
             except Exception as e:
@@ -179,10 +185,10 @@ class PostProcessor(LoggerMixin):
                 "Post processed successfully",
                 post_id=post.id,
                 orders_created=len(orders_created),
-                order_types=[o.service_type for o in orders_created]
+                order_types=[o.service_type for o in orders_created],
+                apis_used=list(set([o.api_provider for o in orders_created]))
             )
         else:
-            # Якщо не створено жодного замовлення але вже є старі - все одно completed
             if existing_orders:
                 await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
                 self.log_info(
@@ -197,53 +203,58 @@ class PostProcessor(LoggerMixin):
                     failed_services=failed_services
                 )
 
-    async def _create_view_orders(
-            self,
-            post: Post,
-            settings: ChannelSettings
-    ) -> List[Order]:
-        """Create orders for views"""
+    def _determine_api_provider(self, service_type: ServiceType, settings: ChannelSettings) -> APIProvider:
+        """Determine which API to use based on service type and configuration"""
 
-        # ДОДАНО: Додаткова перевірка на дублікати
+        # Check channel-specific preferences first
+        if settings.api_preferences:
+            provider = settings.api_preferences.get(service_type)
+            if provider:
+                return APIProvider(provider)
+
+        # Use global settings
+        if service_type == ServiceType.VIEWS:
+            return APIProvider.TWIBOOST if settings.use_twiboost_for_views else APIProvider.NAKRUTOCHKA
+        elif service_type == ServiceType.REACTIONS:
+            return APIProvider.NAKRUTOCHKA if settings.use_nakrutochka_for_reactions else APIProvider.TWIBOOST
+        elif service_type == ServiceType.REPOSTS:
+            return APIProvider.NAKRUTOCHKA if settings.use_nakrutochka_for_reposts else APIProvider.TWIBOOST
+
+        # Default fallback
+        return APIProvider.TWIBOOST
+
+    async def _create_view_orders(
+        self,
+        post: Post,
+        settings: ChannelSettings,
+        api_provider: APIProvider
+    ) -> List[Order]:
+        """Create orders for views (usually Twiboost)"""
+
+        # Check for duplicates
         existing_views = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.VIEWS)
         if existing_views:
             self.log_warning(f"View orders already exist for post {post.id}")
             return []
 
-        # Спочатку перевіряємо збережені service_ids
-        service_ids = settings.twiboost_service_ids or {}
-        service_id = service_ids.get("views")
+        # Get service with fallback support
+        service_info = await service_repo.get_service_with_fallback(
+            service_type="views",
+            quantity=settings.base_quantity,
+            preferred_api=api_provider
+        )
 
-        # Якщо немає збереженого - шукаємо в БД
-        if not service_id:
-            # Шукаємо найкращий сервіс для views в БД
-            service = await service_repo.find_best_service(
-                service_type="views",
-                quantity=settings.base_quantity,
-                name_filter="10 в минуту"  # Пріоритет для гнучкої швидкості
-            )
+        if not service_info:
+            raise ValueError("No view service found in any API")
 
-            if not service:
-                # Якщо не знайшли специфічний - беремо будь-який
-                services = await service_repo.get_services_by_type("views")
-                if services:
-                    service = services[0]
+        service_id = service_info["service_id"]
+        actual_api = service_info["api_provider"]
 
-            if service:
-                service_id = service.service_id
-                # Зберігаємо для наступного разу
-                await channel_repo.update_service_ids(
-                    post.channel_id,
-                    ServiceType.VIEWS,
-                    {"views": service_id}
-                )
-                self.log_info(
-                    "View service selected from DB",
-                    service_id=service_id,
-                    service_name=service.name
-                )
-            else:
-                raise ValueError("No view service found in database")
+        self.log_info(
+            f"View service selected from {actual_api}",
+            service_id=service_id,
+            originally_requested=api_provider
+        )
 
         # Calculate portions (no randomization for views)
         portions = portion_calculator.calculate_portions(
@@ -259,8 +270,9 @@ class PostProcessor(LoggerMixin):
                 "post_id": post.id,
                 "service_type": ServiceType.VIEWS,
                 "service_id": service_id,
+                "api_provider": actual_api,
                 "quantity": portion.quantity,
-                "actual_quantity": portion.quantity,  # No randomization
+                "actual_quantity": portion.quantity,
                 "portion_number": portion.number,
                 "portion_size": portion.quantity,
                 "scheduled_at": portion.scheduled_at,
@@ -268,27 +280,30 @@ class PostProcessor(LoggerMixin):
             }
 
             order = await order_repo.create_order(order_data)
-            orders.append(order)
+            if order:
+                orders.append(order)
 
-            self.log_info(
-                "View order created",
-                order_id=order.id,
-                portion=portion.number,
-                quantity=portion.quantity,
-                scheduled_at=portion.scheduled_at,
-                link=post.link  # Логуємо посилання
-            )
+                self.log_info(
+                    "View order created",
+                    order_id=order.id,
+                    api_provider=actual_api,
+                    portion=portion.number,
+                    quantity=portion.quantity,
+                    scheduled_at=portion.scheduled_at,
+                    link=post.link
+                )
 
         return orders
 
     async def _create_reaction_orders(
-            self,
-            post: Post,
-            settings: ChannelSettings
+        self,
+        post: Post,
+        settings: ChannelSettings,
+        api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for reactions"""
+        """Create orders for reactions (usually Nakrutochka)"""
 
-        # ДОДАНО: Перевірка на дублікати
+        # Check for duplicates
         existing_reactions = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REACTIONS)
         if existing_reactions:
             self.log_warning(f"Reaction orders already exist for post {post.id}")
@@ -311,34 +326,29 @@ class PostProcessor(LoggerMixin):
             settings.reaction_distribution
         )
 
-        # Отримуємо маппінг реакцій з БД
-        reaction_mapping = await service_repo.get_reaction_services()
-
-        if not reaction_mapping:
-            self.log_error("No reaction services found in database")
-            return []
-
         # Create order for each reaction type
         orders = []
         for emoji, quantity in reaction_quantities.items():
-            # ДОДАНО: Перевірка чи вже є замовлення для цієї реакції
+            # Check if order for this emoji already exists
             existing_emoji_order = await order_repo.check_emoji_order_exists(post.id, emoji)
             if existing_emoji_order:
                 self.log_warning(f"Order for reaction {emoji} already exists for post {post.id}")
                 continue
 
-            # Find service ID for this reaction
-            service_key = f"reaction_{emoji}"
-            service_id = reaction_mapping.get(service_key)
+            # Get service for specific emoji with fallback
+            service_info = await service_repo.get_service_with_fallback(
+                service_type="reactions",
+                quantity=quantity,
+                preferred_api=api_provider,
+                emoji=emoji
+            )
 
-            if not service_id:
-                # Спробуємо знайти в збережених налаштуваннях
-                service_ids = settings.twiboost_service_ids or {}
-                service_id = service_ids.get(service_key)
+            if not service_info:
+                self.log_warning(f"No service found for reaction {emoji}")
+                continue
 
-                if not service_id:
-                    self.log_warning(f"No service found for reaction {emoji}")
-                    continue
+            service_id = service_info["service_id"]
+            actual_api = service_info["api_provider"]
 
             # Calculate drip-feed parameters
             runs = settings.calculate_runs(quantity)
@@ -347,80 +357,69 @@ class PostProcessor(LoggerMixin):
                 "post_id": post.id,
                 "service_type": ServiceType.REACTIONS,
                 "service_id": service_id,
-                "quantity": settings.base_quantity,  # Original
-                "actual_quantity": quantity,  # After randomization
+                "api_provider": actual_api,
+                "quantity": settings.base_quantity,
+                "actual_quantity": quantity,
                 "portion_number": 1,
                 "portion_size": quantity,
                 "reaction_emoji": emoji,
                 "runs": runs,
                 "interval": settings.run_interval,
-                "scheduled_at": datetime.now(),  # Start immediately
+                "scheduled_at": datetime.now(),
                 "post_link": post.link
             }
 
             order = await order_repo.create_order(order_data)
-            orders.append(order)
+            if order:
+                orders.append(order)
 
-            self.log_info(
-                "Reaction order created",
-                order_id=order.id,
-                emoji=emoji,
-                quantity=quantity,
-                runs=runs,
-                interval=settings.run_interval,
-                service_id=service_id,
-                link=post.link
-            )
+                self.log_info(
+                    "Reaction order created",
+                    order_id=order.id,
+                    api_provider=actual_api,
+                    emoji=emoji,
+                    quantity=quantity,
+                    runs=runs,
+                    interval=settings.run_interval,
+                    service_id=service_id,
+                    link=post.link
+                )
 
         return orders
 
     async def _create_repost_orders(
-            self,
-            post: Post,
-            settings: ChannelSettings
+        self,
+        post: Post,
+        settings: ChannelSettings,
+        api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for reposts"""
+        """Create orders for reposts (usually Nakrutochka)"""
 
-        # ДОДАНО: Перевірка на дублікати
+        # Check for duplicates
         existing_reposts = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REPOSTS)
         if existing_reposts:
             self.log_warning(f"Repost orders already exist for post {post.id}")
             return []
 
-        # Спочатку перевіряємо збережені service_ids
-        service_ids = settings.twiboost_service_ids or {}
-        service_id = service_ids.get("reposts")
+        # Get service with fallback
+        service_info = await service_repo.get_service_with_fallback(
+            service_type="reposts",
+            quantity=settings.base_quantity,
+            preferred_api=api_provider
+        )
 
-        # Якщо немає збереженого - шукаємо в БД
-        if not service_id:
-            # Шукаємо сервіс для репостів в БД
-            service = await service_repo.find_best_service(
-                service_type="reposts",
-                quantity=settings.base_quantity
-            )
+        if not service_info:
+            self.log_warning("No repost service found in any API")
+            return []
 
-            if not service:
-                # Беремо будь-який доступний
-                services = await service_repo.get_services_by_type("reposts")
-                if services:
-                    service = services[0]
+        service_id = service_info["service_id"]
+        actual_api = service_info["api_provider"]
 
-            if service:
-                service_id = service.service_id
-                # Зберігаємо для наступного разу
-                await channel_repo.update_service_ids(
-                    post.channel_id,
-                    ServiceType.REPOSTS,
-                    {"reposts": service_id}
-                )
-                self.log_info(
-                    "Repost service selected from DB",
-                    service_id=service_id,
-                    service_name=service.name
-                )
-            else:
-                self.log_warning("No repost service found in database")
-                return []
+        self.log_info(
+            f"Repost service selected from {actual_api}",
+            service_id=service_id,
+            originally_requested=api_provider
+        )
 
         # Calculate portions (with randomization)
         portions = portion_calculator.calculate_portions(
@@ -442,29 +441,33 @@ class PostProcessor(LoggerMixin):
             "post_id": post.id,
             "service_type": ServiceType.REPOSTS,
             "service_id": service_id,
+            "api_provider": actual_api,
             "quantity": settings.base_quantity,
             "actual_quantity": portion.quantity,
             "portion_number": 1,
             "portion_size": portion.quantity,
             "runs": runs,
             "interval": settings.run_interval,
-            "scheduled_at": portion.scheduled_at,  # Has delay
+            "scheduled_at": portion.scheduled_at,
             "post_link": post.link
         }
 
         order = await order_repo.create_order(order_data)
 
-        self.log_info(
-            "Repost order created",
-            order_id=order.id,
-            quantity=portion.quantity,
-            runs=runs,
-            scheduled_at=portion.scheduled_at,
-            service_id=service_id,
-            link=post.link
-        )
+        if order:
+            self.log_info(
+                "Repost order created",
+                order_id=order.id,
+                api_provider=actual_api,
+                quantity=portion.quantity,
+                runs=runs,
+                scheduled_at=portion.scheduled_at,
+                service_id=service_id,
+                link=post.link
+            )
+            return [order]
 
-        return [order]
+        return []
 
     async def get_processing_stats(self) -> Dict[str, Any]:
         """Get processing statistics"""
@@ -495,16 +498,13 @@ class PostProcessor(LoggerMixin):
 
         self.log_info(f"Reprocessing {len(failed_posts)} failed posts")
 
-        # ДОДАНО: Перевірка чи мають failed posts вже замовлення
         reprocess_count = 0
         for post in failed_posts:
             existing_orders = await order_repo.get_orders_by_post(post.id)
             if existing_orders:
-                # Якщо є замовлення - просто міняємо статус на completed
                 await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
                 self.log_info(f"Post {post.id} has orders, marking as completed")
             else:
-                # Якщо немає - повертаємо на обробку
                 await post_repo.update_status(post.id, PostStatus.NEW)
                 reprocess_count += 1
 

@@ -1,6 +1,6 @@
 """
 Telegram SMM Bot - Main entry point
-Automated promotion service for Telegram channels
+Automated promotion service for Telegram channels with dual API support
 """
 import asyncio
 import signal
@@ -16,6 +16,7 @@ from src.bot.telegram_monitor import TelegramMonitor, telegram_monitor
 from src.bot.handlers import BotHandlers
 from src.scheduler.tasks import task_scheduler
 from src.services.twiboost_client import twiboost_client
+from src.services.nakrutochka_client import nakrutochka_client
 from src.database.repositories.channel_repo import channel_repo
 
 
@@ -25,7 +26,7 @@ logger = get_logger(__name__)
 
 
 class TelegramSMMBot:
-    """Main bot application"""
+    """Main bot application with dual API support"""
 
     def __init__(self):
         self.app: Optional[Application] = None
@@ -35,7 +36,7 @@ class TelegramSMMBot:
 
     async def initialize(self):
         """Initialize all components"""
-        logger.info("🚀 Initializing Telegram SMM Bot...")
+        logger.info("🚀 Initializing Telegram SMM Bot with Dual API Support...")
 
         try:
             # 1. Test database connection
@@ -51,48 +52,63 @@ class TelegramSMMBot:
             logger.info("Initializing Twiboost client...")
             await twiboost_client.init()
 
-            # Test API connection
-            balance = await twiboost_client.get_balance()
-            logger.info(f"✅ Twiboost connected. Balance: {balance['balance']} {balance['currency']}")
+            # Test Twiboost API connection
+            twiboost_balance = await twiboost_client.get_balance()
+            logger.info(f"✅ Twiboost connected. Balance: {twiboost_balance['balance']} {twiboost_balance['currency']}")
 
-            # 3. ВАЖЛИВО! Синхронізуємо сервіси з API в БД при старті
-            logger.info("🔄 Syncing Twiboost services to database...")
-            services = await twiboost_client.get_services()
-            logger.info(f"✅ Found {len(services)} total services from API")
+            # 3. Initialize Nakrutochka client
+            logger.info("Initializing Nakrutochka client...")
+            await nakrutochka_client.init()
 
-            # Зберігаємо сервіси в БД
-            synced_count = await service_repo.sync_services(services)
-            logger.info(f"✅ Synced {synced_count} Telegram services to database")
+            # Test Nakrutochka API connection
+            nakrutochka_balance = await nakrutochka_client.get_balance()
+            logger.info(f"✅ Nakrutochka connected. Balance: {nakrutochka_balance['balance']} {nakrutochka_balance['currency']}")
 
-            # Перевіряємо що є в БД
+            # 4. Sync services from BOTH APIs
+            logger.info("🔄 Syncing services from both APIs...")
+
+            # Sync Twiboost services (for views)
+            logger.info("Syncing Twiboost services...")
+            twiboost_services = await twiboost_client.get_services()
+            twiboost_synced = await service_repo.sync_twiboost_services(twiboost_services)
+            logger.info(f"✅ Synced {twiboost_synced} Twiboost services")
+
+            # Sync Nakrutochka services (for reactions and reposts)
+            logger.info("Syncing Nakrutochka services...")
+            nakrutochka_services = await nakrutochka_client.get_services()
+            nakrutochka_synced = await service_repo.sync_nakrutochka_services(nakrutochka_services)
+            logger.info(f"✅ Synced {nakrutochka_synced} Nakrutochka services")
+
+            # Get service counts
             view_services = await service_repo.get_services_by_type("views")
-            reaction_services = await service_repo.get_services_by_type("reactions")
-            repost_services = await service_repo.get_services_by_type("reposts")
+            reaction_services_nakrutochka = await service_repo.get_nakrutochka_services_by_type("reactions")
+            repost_services_nakrutochka = await service_repo.get_nakrutochka_services_by_type("reposts")
 
             logger.info(
                 f"📊 Services in database:\n"
-                f"  • Views: {len(view_services)} services\n"
-                f"  • Reactions: {len(reaction_services)} services\n"
-                f"  • Reposts: {len(repost_services)} services"
+                f"  • Views (Twiboost): {len(view_services)} services\n"
+                f"  • Reactions (Nakrutochka): {len(reaction_services_nakrutochka)} services\n"
+                f"  • Reposts (Nakrutochka): {len(repost_services_nakrutochka)} services"
             )
 
-            # Виводимо приклади ID для налагодження
-            if view_services:
-                logger.info(f"  Example view service: ID={view_services[0].service_id}, Name={view_services[0].name[:50]}")
-            if reaction_services:
-                logger.info(f"  Example reaction service: ID={reaction_services[0].service_id}, Name={reaction_services[0].name[:50]}")
-            if repost_services:
-                logger.info(f"  Example repost service: ID={repost_services[0].service_id}, Name={repost_services[0].name[:50]}")
+            # Display API configuration
+            logger.info(
+                f"🔧 API Configuration:\n"
+                f"  • Views: {'Twiboost' if settings.use_twiboost_for_views else 'Nakrutochka'}\n"
+                f"  • Reactions: {'Nakrutochka' if settings.use_nakrutochka_for_reactions else 'Twiboost'}\n"
+                f"  • Reposts: {'Nakrutochka' if settings.use_nakrutochka_for_reposts else 'Twiboost'}\n"
+                f"  • Fallback enabled: {settings.enable_api_fallback}"
+            )
 
-            # 4. Initialize Telegram bot
+            # 5. Initialize Telegram bot
             logger.info("Initializing Telegram bot...")
             self.app = Application.builder().token(settings.telegram_bot_token).build()
 
-            # 5. Setup handlers
+            # 6. Setup handlers
             self.handlers = BotHandlers(self.app)
             logger.info("✅ Bot handlers configured")
 
-            # 6. Initialize monitor
+            # 7. Initialize monitor
             self.monitor = TelegramMonitor(settings.telegram_bot_token)
 
             # Set global instance
@@ -101,21 +117,26 @@ class TelegramSMMBot:
 
             logger.info("✅ Telegram monitor initialized")
 
-            # 7. Validate existing channels
+            # 8. Validate existing channels
             logger.info("Validating existing channels...")
             await self.monitor.validate_all_channels()
 
-            # 8. Оновлюємо service_ids для всіх каналів
-            logger.info("Updating channel service mappings...")
+            # 9. Update service mappings for all channels
+            logger.info("Updating channel service mappings for dual API...")
             channels = await channel_repo.get_active_channels()
 
             for channel in channels:
-                # Отримуємо маппінг реакцій
-                reaction_mapping = await service_repo.get_reaction_services()
+                # Update API preferences
+                api_preferences = {
+                    "views": "twiboost",
+                    "reactions": "nakrutochka",
+                    "reposts": "nakrutochka"
+                }
 
-                # Оновлюємо views
+                await channel_repo.update_api_preferences(channel.id, api_preferences)
+
+                # Update Twiboost service IDs (views)
                 if view_services:
-                    # Шукаємо оптимальний сервіс
                     best_view = None
                     for service in view_services:
                         if '10 в минуту' in service.name or '10 в мин' in service.name:
@@ -128,33 +149,42 @@ class TelegramSMMBot:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "views",
-                        {"views": best_view}
+                        {"views": best_view},
+                        api_provider="twiboost"
                     )
 
-                # Оновлюємо reactions
-                if reaction_mapping:
-                    await channel_repo.update_service_ids(
-                        channel.id,
-                        "reactions",
-                        reaction_mapping
-                    )
+                # Update Nakrutochka service IDs (reactions)
+                if reaction_services_nakrutochka:
+                    reaction_mapping = {}
+                    for service in reaction_services_nakrutochka:
+                        if service.emoji:
+                            reaction_mapping[f"reaction_{service.emoji}"] = service.service_id
 
-                # Оновлюємо reposts
-                if repost_services:
+                    if reaction_mapping:
+                        await channel_repo.update_service_ids(
+                            channel.id,
+                            "reactions",
+                            reaction_mapping,
+                            api_provider="nakrutochka"
+                        )
+
+                # Update Nakrutochka service IDs (reposts)
+                if repost_services_nakrutochka:
                     await channel_repo.update_service_ids(
                         channel.id,
                         "reposts",
-                        {"reposts": repost_services[0].service_id}
+                        {"reposts": repost_services_nakrutochka[0].service_id},
+                        api_provider="nakrutochka"
                     )
 
                 logger.info(f"✅ Updated service mappings for channel: {channel.title}")
 
-            # 9. Start scheduler
+            # 10. Start scheduler
             logger.info("Starting task scheduler...")
             await task_scheduler.start()
             logger.info("✅ Scheduler started")
 
-            logger.info("✨ Bot initialization complete!")
+            logger.info("✨ Bot initialization complete with dual API support!")
 
         except Exception as e:
             logger.error(f"❌ Initialization failed: {e}")
@@ -179,12 +209,17 @@ class TelegramSMMBot:
             monitor_task = asyncio.create_task(self.monitor.start_monitoring())
 
             logger.info("✅ Channel monitoring started")
-            logger.info("🎉 Bot is fully operational!")
+            logger.info("🎉 Bot is fully operational with dual API support!")
 
             # Show admin info
             if settings.admin_telegram_id:
                 logger.info(f"📱 Admin Telegram ID: {settings.admin_telegram_id}")
                 logger.info("Send /start to the bot to begin")
+
+            # Show API status
+            logger.info("📊 API Status:")
+            logger.info(f"  • Twiboost: Active for Views")
+            logger.info(f"  • Nakrutochka: Active for Reactions & Reposts")
 
             # Keep running
             while self.running:
@@ -220,8 +255,9 @@ class TelegramSMMBot:
                 await self.app.stop()
                 await self.app.shutdown()
 
-            # Close Twiboost client
+            # Close API clients
             await twiboost_client.close()
+            await nakrutochka_client.close()
 
             # Close database
             await db.close()
@@ -242,17 +278,20 @@ async def run_migrations():
     logger.info("Running database migrations...")
 
     try:
-        # Read migration file
+        # Read and execute initial migration
         with open("migrations/001_initial_schema.sql", "r") as f:
             schema = f.read()
-
-        # Execute migration
         await db.execute(schema)
+        logger.info("✅ Initial schema migration completed")
 
-        logger.info("✅ Migrations completed")
+        # Read and execute Nakrutochka migration
+        with open("migrations/002_nakrutochka_services.sql", "r") as f:
+            nakrutochka_schema = f.read()
+        await db.execute(nakrutochka_schema)
+        logger.info("✅ Nakrutochka integration migration completed")
 
-    except FileNotFoundError:
-        logger.warning("Migration file not found, skipping migrations")
+    except FileNotFoundError as e:
+        logger.warning(f"Migration file not found: {e}")
     except Exception as e:
         logger.error(f"Migration error: {e}")
         # Don't fail if tables already exist
@@ -265,12 +304,18 @@ async def main():
     logger.info("=" * 50)
     logger.info("TELEGRAM SMM BOT")
     logger.info("Automated Promotion Service")
+    logger.info("Dual API Support: Twiboost + Nakrutochka")
     logger.info("=" * 50)
 
     # Check environment
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Check interval: {settings.check_interval}s")
     logger.info(f"Process interval: {settings.process_interval}s")
+
+    # Show API configuration
+    logger.info("API Configuration:")
+    logger.info(f"  • Twiboost API: {settings.twiboost_api_url}")
+    logger.info(f"  • Nakrutochka API: {settings.nakrutochka_api_url}")
 
     try:
         # Initialize database connection first
