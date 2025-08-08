@@ -124,9 +124,8 @@ class PostProcessor(LoggerMixin):
                 "No settings found for channel",
                 channel_id=post.channel_id
             )
-            # Create default settings
-            await channel_repo.bulk_create_default_settings(post.channel_id)
-            all_settings = await channel_repo.get_channel_settings(post.channel_id)
+            await post_repo.update_status(post.id, PostStatus.FAILED)
+            return
 
         # Get channel username
         channel = await channel_repo.get_channel(post.channel_id)
@@ -140,7 +139,10 @@ class PostProcessor(LoggerMixin):
         for settings in all_settings:
             try:
                 # Check if orders of this type already exist
-                existing_type_orders = [o for o in existing_orders if o.service_type == settings.service_type]
+                existing_type_orders = await order_repo.get_orders_by_post_and_type(
+                    post.id,
+                    settings.service_type
+                )
                 if existing_type_orders:
                     self.log_warning(
                         f"Orders of type {settings.service_type} already exist for post {post.id}",
@@ -228,23 +230,29 @@ class PostProcessor(LoggerMixin):
             return []
 
         # Get metadata for portions
-        metadata = await self._get_metadata(settings.channel_id, 'views')
+        metadata = settings.metadata if hasattr(settings, 'metadata') and settings.metadata else await self._get_metadata(settings.channel_id, 'views')
         portions_config = metadata.get('portions', []) if metadata else []
 
         if not portions_config:
             # Fallback to simple portions
+            self.log_warning(f"No portions config found for channel {settings.channel_id}, using simple order")
             return await self._create_simple_view_orders(post, settings, api_provider)
 
         # Get service ID
         service_ids = settings.twiboost_service_ids or {}
-        service_id = service_ids.get("views", 4217)
+        service_id = int(service_ids.get("views", 4217))
 
         orders = []
+
+        self.log_info(f"Creating {len(portions_config)} view portions for post {post.id}")
 
         for portion_config in portions_config:
             # Calculate scheduled time
             delay_minutes = portion_config.get('delay', 0)
             scheduled_at = datetime.now() + timedelta(minutes=delay_minutes) if delay_minutes > 0 else datetime.now()
+
+            # Get total for this portion
+            total_quantity = portion_config.get('total', portion_config['runs'] * portion_config['quantity'])
 
             # Create order with drip-feed settings
             order_data = {
@@ -252,8 +260,8 @@ class PostProcessor(LoggerMixin):
                 "service_type": ServiceType.VIEWS,
                 "service_id": service_id,
                 "api_provider": api_provider,
-                "quantity": portion_config.get('total', portion_config['runs'] * portion_config['quantity']),
-                "actual_quantity": portion_config.get('total', portion_config['runs'] * portion_config['quantity']),
+                "quantity": total_quantity,
+                "actual_quantity": total_quantity,
                 "portion_number": portion_config['number'],
                 "portion_size": portion_config['quantity'],  # Per run
                 "runs": portion_config['runs'],
@@ -269,7 +277,7 @@ class PostProcessor(LoggerMixin):
                 self.log_info(
                     f"View portion {portion_config['number']} created",
                     order_id=order.id,
-                    total_quantity=order.quantity,
+                    total_quantity=total_quantity,
                     runs=portion_config['runs'],
                     per_run=portion_config['quantity'],
                     interval=portion_config['interval'],
@@ -287,7 +295,7 @@ class PostProcessor(LoggerMixin):
     ) -> List[Order]:
         """Fallback to simple view orders"""
         service_ids = settings.twiboost_service_ids or {}
-        service_id = service_ids.get("views", 4217)
+        service_id = int(service_ids.get("views", 4217))
 
         order_data = {
             "post_id": post.id,
@@ -320,7 +328,7 @@ class PostProcessor(LoggerMixin):
             return []
 
         # Get metadata
-        metadata = await self._get_metadata(settings.channel_id, 'reactions')
+        metadata = settings.metadata if hasattr(settings, 'metadata') and settings.metadata else await self._get_metadata(settings.channel_id, 'reactions')
         reaction_distribution = metadata.get('reaction_distribution', {}) if metadata else {}
 
         if not reaction_distribution:
@@ -334,8 +342,7 @@ class PostProcessor(LoggerMixin):
             max_val = int(total_reactions * (1 + settings.randomization_percent / 100))
             total_reactions = random.randint(min_val, max_val)
 
-        # Get service IDs mapping
-        service_ids = settings.nakrutochka_service_ids or {}
+        self.log_info(f"Creating reaction orders with total {total_reactions} (base: {settings.base_quantity})")
 
         orders = []
 
@@ -361,9 +368,6 @@ class PostProcessor(LoggerMixin):
 
             if quantity <= 0:
                 continue
-
-            # Check if service exists in database
-            service_key = f"reaction_{nakrutochka_service_id}"
 
             # Calculate drip-feed
             runs = max(1, quantity // settings.drops_per_run)
@@ -421,7 +425,7 @@ class PostProcessor(LoggerMixin):
 
         # Get service ID
         service_ids = settings.nakrutochka_service_ids or {}
-        service_id = service_ids.get("reposts", 3943)
+        service_id = int(service_ids.get("reposts", 3943))
 
         # Apply randomization
         quantity = settings.base_quantity
@@ -430,8 +434,11 @@ class PostProcessor(LoggerMixin):
             max_val = int(quantity * (1 + settings.randomization_percent / 100))
             quantity = random.randint(min_val, max_val)
 
+        self.log_info(f"Creating repost order with quantity {quantity} (base: {settings.base_quantity})")
+
         # Calculate drip-feed
         runs = max(1, quantity // settings.drops_per_run)
+        quantity_per_run = settings.drops_per_run
 
         # Schedule time (0 means immediate)
         scheduled_at = datetime.now() if settings.repost_delay_minutes == 0 else \
@@ -442,10 +449,10 @@ class PostProcessor(LoggerMixin):
             "service_type": ServiceType.REPOSTS,
             "service_id": service_id,
             "api_provider": api_provider,
-            "quantity": settings.base_quantity,
+            "quantity": quantity,
             "actual_quantity": quantity,
             "portion_number": 1,
-            "portion_size": settings.drops_per_run,
+            "portion_size": quantity_per_run,
             "runs": runs,
             "interval": settings.run_interval,
             "scheduled_at": scheduled_at,
@@ -460,6 +467,8 @@ class PostProcessor(LoggerMixin):
                 order_id=order.id,
                 quantity=quantity,
                 runs=runs,
+                per_run=quantity_per_run,
+                interval=settings.run_interval,
                 scheduled_at=scheduled_at,
                 service_id=service_id,
                 link=post.link
@@ -480,7 +489,7 @@ class PostProcessor(LoggerMixin):
         row = await db.fetchrow(query, channel_id, service_type)
 
         if row and row['metadata']:
-            return json.loads(row['metadata']) if isinstance(row['metadata'], str) else row['metadata']
+            return row['metadata'] if isinstance(row['metadata'], dict) else json.loads(row['metadata'])
 
         return None
 
@@ -525,30 +534,6 @@ class PostProcessor(LoggerMixin):
 
         if reprocess_count > 0:
             return await self.process_new_posts(reprocess_count)
-        return 0
-
-    async def process_old_posts_for_channel(self, channel_id: int, start_message_id: int, max_posts: int = 1):
-        """Process specific old posts for a channel"""
-        self.log_info(
-            f"Processing old posts for channel {channel_id}",
-            start_message_id=start_message_id,
-            max_posts=max_posts
-        )
-
-        # Add old post if not exists
-        post_data = {
-            "channel_id": channel_id,
-            "message_id": start_message_id,
-            "content": "Old post for processing",
-            "status": PostStatus.NEW
-        }
-
-        post = await post_repo.create_post(post_data)
-
-        if post:
-            await self._process_single_post(post)
-            return 1
-
         return 0
 
 
