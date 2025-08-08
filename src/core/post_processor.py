@@ -1,10 +1,11 @@
 """
-Post processor - creates orders for new posts with dual API support
+Post processor - creates orders for new posts with advanced portion support
 """
 import asyncio
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
+import json
 
 from src.database.models import (
     Post, PostStatus, Order, OrderStatus,
@@ -14,7 +15,6 @@ from src.database.repositories.post_repo import post_repo
 from src.database.repositories.channel_repo import channel_repo
 from src.database.repositories.order_repo import order_repo
 from src.database.repositories.service_repo import service_repo
-from src.core.portion_calculator import portion_calculator
 from src.services.twiboost_client import twiboost_client
 from src.services.nakrutochka_client import nakrutochka_client
 from src.utils.logger import get_logger, LoggerMixin, metrics
@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 
 class PostProcessor(LoggerMixin):
-    """Process new posts and create orders with dual API support"""
+    """Process new posts and create orders with advanced portion support"""
 
     def __init__(self):
         self.processing_lock = asyncio.Lock()
@@ -148,7 +148,7 @@ class PostProcessor(LoggerMixin):
                     )
                     continue
 
-                # Determine API provider based on service type and settings
+                # Determine API provider
                 api_provider = self._determine_api_provider(settings.service_type, settings)
 
                 self.log_info(
@@ -158,11 +158,11 @@ class PostProcessor(LoggerMixin):
                 )
 
                 if settings.service_type == ServiceType.VIEWS:
-                    orders = await self._create_view_orders(post, settings, api_provider)
+                    orders = await self._create_advanced_view_orders(post, settings, api_provider)
                     orders_created.extend(orders)
 
                 elif settings.service_type == ServiceType.REACTIONS:
-                    orders = await self._create_reaction_orders(post, settings, api_provider)
+                    orders = await self._create_advanced_reaction_orders(post, settings, api_provider)
                     orders_created.extend(orders)
 
                 elif settings.service_type == ServiceType.REPOSTS:
@@ -185,51 +185,40 @@ class PostProcessor(LoggerMixin):
                 "Post processed successfully",
                 post_id=post.id,
                 orders_created=len(orders_created),
-                order_types=[o.service_type for o in orders_created],
-                apis_used=list(set([o.api_provider for o in orders_created]))
+                order_types=[o.service_type for o in orders_created]
             )
         else:
-            if existing_orders:
-                await post_repo.update_status(post.id, PostStatus.COMPLETED, processed_at=True)
-                self.log_info(
-                    "Post already has orders, marked as completed",
-                    post_id=post.id
-                )
-            else:
-                await post_repo.update_status(post.id, PostStatus.FAILED)
-                self.log_error(
-                    "No orders created for post",
-                    post_id=post.id,
-                    failed_services=failed_services
-                )
+            await post_repo.update_status(post.id, PostStatus.FAILED)
+            self.log_error(
+                "No orders created for post",
+                post_id=post.id,
+                failed_services=failed_services
+            )
 
     def _determine_api_provider(self, service_type: ServiceType, settings: ChannelSettings) -> APIProvider:
-        """Determine which API to use based on service type and configuration"""
-
-        # Check channel-specific preferences first
+        """Determine which API to use based on service type"""
         if settings.api_preferences:
             provider = settings.api_preferences.get(service_type)
             if provider:
                 return APIProvider(provider)
 
-        # Use global settings
+        # Defaults
         if service_type == ServiceType.VIEWS:
-            return APIProvider.TWIBOOST if settings.use_twiboost_for_views else APIProvider.NAKRUTOCHKA
+            return APIProvider.TWIBOOST
         elif service_type == ServiceType.REACTIONS:
-            return APIProvider.NAKRUTOCHKA if settings.use_nakrutochka_for_reactions else APIProvider.TWIBOOST
+            return APIProvider.NAKRUTOCHKA
         elif service_type == ServiceType.REPOSTS:
-            return APIProvider.NAKRUTOCHKA if settings.use_nakrutochka_for_reposts else APIProvider.TWIBOOST
+            return APIProvider.NAKRUTOCHKA
 
-        # Default fallback
         return APIProvider.TWIBOOST
 
-    async def _create_view_orders(
+    async def _create_advanced_view_orders(
         self,
         post: Post,
         settings: ChannelSettings,
         api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for views (usually Twiboost)"""
+        """Create orders for views with advanced portion configuration"""
 
         # Check for duplicates
         existing_views = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.VIEWS)
@@ -237,45 +226,38 @@ class PostProcessor(LoggerMixin):
             self.log_warning(f"View orders already exist for post {post.id}")
             return []
 
-        # Get service with fallback support
-        service_info = await service_repo.get_service_with_fallback(
-            service_type="views",
-            quantity=settings.base_quantity,
-            preferred_api=api_provider
-        )
+        # Get metadata for portions
+        metadata = await self._get_metadata(settings.channel_id, 'views')
+        portions_config = metadata.get('portions', []) if metadata else []
 
-        if not service_info:
-            raise ValueError("No view service found in any API")
+        if not portions_config:
+            # Fallback to simple portions
+            return await self._create_simple_view_orders(post, settings, api_provider)
 
-        service_id = service_info["service_id"]
-        actual_api = service_info["api_provider"]
+        # Get service ID
+        service_ids = settings.twiboost_service_ids or {}
+        service_id = service_ids.get("views", 4217)  # Your specific service ID
 
-        self.log_info(
-            f"View service selected from {actual_api}",
-            service_id=service_id,
-            originally_requested=api_provider
-        )
-
-        # Calculate portions (no randomization for views)
-        portions = portion_calculator.calculate_portions(
-            settings.base_quantity,
-            settings,
-            ServiceType.VIEWS
-        )
-
-        # Create order for each portion
         orders = []
-        for portion in portions:
+
+        for portion_config in portions_config:
+            # Calculate scheduled time
+            delay_minutes = portion_config.get('delay', 0)
+            scheduled_at = datetime.now() + timedelta(minutes=delay_minutes) if delay_minutes > 0 else datetime.now()
+
+            # Create order with drip-feed settings
             order_data = {
                 "post_id": post.id,
                 "service_type": ServiceType.VIEWS,
                 "service_id": service_id,
-                "api_provider": actual_api,
-                "quantity": portion.quantity,
-                "actual_quantity": portion.quantity,
-                "portion_number": portion.number,
-                "portion_size": portion.quantity,
-                "scheduled_at": portion.scheduled_at,
+                "api_provider": api_provider,
+                "quantity": portion_config['runs'] * portion_config['quantity'],  # Total for this portion
+                "actual_quantity": portion_config['runs'] * portion_config['quantity'],
+                "portion_number": portion_config['number'],
+                "portion_size": portion_config['quantity'],  # Per run
+                "runs": portion_config['runs'],
+                "interval": portion_config['interval'],
+                "scheduled_at": scheduled_at,
                 "post_link": post.link
             }
 
@@ -284,24 +266,51 @@ class PostProcessor(LoggerMixin):
                 orders.append(order)
 
                 self.log_info(
-                    "View order created",
+                    f"View portion {portion_config['number']} created",
                     order_id=order.id,
-                    api_provider=actual_api,
-                    portion=portion.number,
-                    quantity=portion.quantity,
-                    scheduled_at=portion.scheduled_at,
+                    total_quantity=order.quantity,
+                    runs=portion_config['runs'],
+                    per_run=portion_config['quantity'],
+                    interval=portion_config['interval'],
+                    delay=delay_minutes,
                     link=post.link
                 )
 
         return orders
 
-    async def _create_reaction_orders(
+    async def _create_simple_view_orders(
         self,
         post: Post,
         settings: ChannelSettings,
         api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for reactions (usually Nakrutochka)"""
+        """Fallback to simple view orders"""
+        service_ids = settings.twiboost_service_ids or {}
+        service_id = service_ids.get("views", 4217)
+
+        order_data = {
+            "post_id": post.id,
+            "service_type": ServiceType.VIEWS,
+            "service_id": service_id,
+            "api_provider": api_provider,
+            "quantity": settings.base_quantity,
+            "actual_quantity": settings.base_quantity,
+            "portion_number": 1,
+            "portion_size": settings.base_quantity,
+            "scheduled_at": datetime.now(),
+            "post_link": post.link
+        }
+
+        order = await order_repo.create_order(order_data)
+        return [order] if order else []
+
+    async def _create_advanced_reaction_orders(
+        self,
+        post: Post,
+        settings: ChannelSettings,
+        api_provider: APIProvider
+    ) -> List[Order]:
+        """Create orders for reactions with multiple services"""
 
         # Check for duplicates
         existing_reactions = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REACTIONS)
@@ -309,60 +318,51 @@ class PostProcessor(LoggerMixin):
             self.log_warning(f"Reaction orders already exist for post {post.id}")
             return []
 
-        if not settings.reaction_distribution:
-            self.log_warning("No reaction distribution configured")
+        # Get metadata
+        metadata = await self._get_metadata(settings.channel_id, 'reactions')
+        reaction_distribution = metadata.get('reaction_distribution', {}) if metadata else {}
+
+        if not reaction_distribution:
+            # Fallback to simple reactions
             return []
 
         # Apply randomization to total
-        total_reactions = portion_calculator._apply_randomization(
-            settings.base_quantity,
-            settings.randomization_percent,
-            ServiceType.REACTIONS
-        )
+        total_reactions = settings.base_quantity
+        if settings.randomization_percent > 0:
+            min_val = int(total_reactions * (1 - settings.randomization_percent / 100))
+            max_val = int(total_reactions * (1 + settings.randomization_percent / 100))
+            total_reactions = random.randint(min_val, max_val)
 
-        # Distribute among reaction types
-        reaction_quantities = portion_calculator.distribute_reactions(
-            total_reactions,
-            settings.reaction_distribution
-        )
+        # Get service IDs
+        service_ids = settings.nakrutochka_service_ids or {}
 
-        # Create order for each reaction type
         orders = []
-        for emoji, quantity in reaction_quantities.items():
-            # Check if order for this emoji already exists
-            existing_emoji_order = await order_repo.check_emoji_order_exists(post.id, emoji)
-            if existing_emoji_order:
-                self.log_warning(f"Order for reaction {emoji} already exists for post {post.id}")
+
+        # Create orders for each reaction type
+        for reaction_type, percentage in reaction_distribution.items():
+            quantity = int(total_reactions * percentage / 100)
+
+            # Get service ID for this reaction type
+            service_key = f"reaction_{reaction_type}"
+            service_id = service_ids.get(service_key)
+
+            if not service_id:
+                self.log_warning(f"No service ID for reaction type {reaction_type}")
                 continue
 
-            # Get service for specific emoji with fallback
-            service_info = await service_repo.get_service_with_fallback(
-                service_type="reactions",
-                quantity=quantity,
-                preferred_api=api_provider,
-                emoji=emoji
-            )
-
-            if not service_info:
-                self.log_warning(f"No service found for reaction {emoji}")
-                continue
-
-            service_id = service_info["service_id"]
-            actual_api = service_info["api_provider"]
-
-            # Calculate drip-feed parameters
-            runs = settings.calculate_runs(quantity)
+            # Calculate drip-feed
+            runs = max(1, quantity // settings.drops_per_run)
 
             order_data = {
                 "post_id": post.id,
                 "service_type": ServiceType.REACTIONS,
                 "service_id": service_id,
-                "api_provider": actual_api,
-                "quantity": settings.base_quantity,
+                "api_provider": api_provider,
+                "quantity": quantity,
                 "actual_quantity": quantity,
                 "portion_number": 1,
-                "portion_size": quantity,
-                "reaction_emoji": emoji,
+                "portion_size": settings.drops_per_run,
+                "reaction_emoji": reaction_type,  # Store reaction type
                 "runs": runs,
                 "interval": settings.run_interval,
                 "scheduled_at": datetime.now(),
@@ -374,14 +374,12 @@ class PostProcessor(LoggerMixin):
                 orders.append(order)
 
                 self.log_info(
-                    "Reaction order created",
+                    f"Reaction order created for {reaction_type}",
                     order_id=order.id,
-                    api_provider=actual_api,
-                    emoji=emoji,
                     quantity=quantity,
+                    service_id=service_id,
                     runs=runs,
                     interval=settings.run_interval,
-                    service_id=service_id,
                     link=post.link
                 )
 
@@ -393,7 +391,7 @@ class PostProcessor(LoggerMixin):
         settings: ChannelSettings,
         api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for reposts (usually Nakrutochka)"""
+        """Create orders for reposts"""
 
         # Check for duplicates
         existing_reposts = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REPOSTS)
@@ -401,54 +399,36 @@ class PostProcessor(LoggerMixin):
             self.log_warning(f"Repost orders already exist for post {post.id}")
             return []
 
-        # Get service with fallback
-        service_info = await service_repo.get_service_with_fallback(
-            service_type="reposts",
-            quantity=settings.base_quantity,
-            preferred_api=api_provider
-        )
+        # Get service ID
+        service_ids = settings.nakrutochka_service_ids or {}
+        service_id = service_ids.get("reposts", 3943)  # Your specific service ID
 
-        if not service_info:
-            self.log_warning("No repost service found in any API")
-            return []
-
-        service_id = service_info["service_id"]
-        actual_api = service_info["api_provider"]
-
-        self.log_info(
-            f"Repost service selected from {actual_api}",
-            service_id=service_id,
-            originally_requested=api_provider
-        )
-
-        # Calculate portions (with randomization)
-        portions = portion_calculator.calculate_portions(
-            settings.base_quantity,
-            settings,
-            ServiceType.REPOSTS
-        )
-
-        # Should be only one portion for reposts
-        if not portions:
-            return []
-
-        portion = portions[0]
+        # Apply randomization
+        quantity = settings.base_quantity
+        if settings.randomization_percent > 0:
+            min_val = int(quantity * (1 - settings.randomization_percent / 100))
+            max_val = int(quantity * (1 + settings.randomization_percent / 100))
+            quantity = random.randint(min_val, max_val)
 
         # Calculate drip-feed
-        runs = settings.calculate_runs(portion.quantity)
+        runs = max(1, quantity // settings.drops_per_run)
+
+        # Schedule time (0 means immediate)
+        scheduled_at = datetime.now() if settings.repost_delay_minutes == 0 else \
+                      datetime.now() + timedelta(minutes=settings.repost_delay_minutes)
 
         order_data = {
             "post_id": post.id,
             "service_type": ServiceType.REPOSTS,
             "service_id": service_id,
-            "api_provider": actual_api,
+            "api_provider": api_provider,
             "quantity": settings.base_quantity,
-            "actual_quantity": portion.quantity,
+            "actual_quantity": quantity,
             "portion_number": 1,
-            "portion_size": portion.quantity,
+            "portion_size": settings.drops_per_run,
             "runs": runs,
             "interval": settings.run_interval,
-            "scheduled_at": portion.scheduled_at,
+            "scheduled_at": scheduled_at,
             "post_link": post.link
         }
 
@@ -458,16 +438,31 @@ class PostProcessor(LoggerMixin):
             self.log_info(
                 "Repost order created",
                 order_id=order.id,
-                api_provider=actual_api,
-                quantity=portion.quantity,
+                quantity=quantity,
                 runs=runs,
-                scheduled_at=portion.scheduled_at,
+                scheduled_at=scheduled_at,
                 service_id=service_id,
                 link=post.link
             )
             return [order]
 
         return []
+
+    async def _get_metadata(self, channel_id: int, service_type: str) -> Optional[Dict]:
+        """Get metadata from channel settings"""
+        query = """
+            SELECT metadata
+            FROM channel_settings
+            WHERE channel_id = $1 AND service_type = $2
+            LIMIT 1
+        """
+
+        row = await db.fetchrow(query, channel_id, service_type)
+
+        if row and row['metadata']:
+            return json.loads(row['metadata']) if isinstance(row['metadata'], str) else row['metadata']
+
+        return None
 
     async def get_processing_stats(self) -> Dict[str, Any]:
         """Get processing statistics"""
@@ -512,6 +507,9 @@ class PostProcessor(LoggerMixin):
             return await self.process_new_posts(reprocess_count)
         return 0
 
+
+# Import database connection
+from src.database.connection import db
 
 # Global processor instance
 post_processor = PostProcessor()
