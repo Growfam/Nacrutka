@@ -1,8 +1,9 @@
 """
-Order sender - sends ready orders to Nakrutka API
+Order sender - sends ready orders to Nakrutka API (FIXED)
 """
 import asyncio
 import logging
+import json
 from datetime import datetime
 from typing import Dict, Any, Optional
 
@@ -74,70 +75,77 @@ class OrderSender:
             f"(runs={order['runs']}, interval={order['interval']})"
         )
 
-        # Prepare API call
-        api_data = {
-            'service': order['service_id'],
-            'link': order['link'],
-            'quantity': order['quantity']
-        }
-
-        # Add drip-feed if needed
-        if order['runs'] > 1:
-            api_data['runs'] = order['runs']
-            api_data['interval'] = order['interval']
-
-        # Send to Nakrutka
-        result = await self.nakrutka.create_order(**api_data)
-
-        if result and 'order' in result:
-            nakrutka_order_id = str(result['order'])
-
-            # Update order status
-            await self.db.execute("""
-                UPDATE ready_orders 
-                SET status = 'sent',
-                    nakrutka_order_id = $1,
-                    sent_at = $2
-                WHERE id = $3
-            """, nakrutka_order_id, datetime.utcnow(), order_id)
-
-            # Log to database
-            await self.db.execute("""
-                INSERT INTO logs (level, message, context)
-                VALUES ('info', 'Order sent successfully', $1)
-            """, {
-                'order_id': order_id,
-                'nakrutka_id': nakrutka_order_id,
-                'service_type': order['service_type'],
-                'quantity': order['quantity'],
-                'charge': result.get('charge', 0),
-                'balance': result.get('balance', 0)
-            })
-
-            logger.info(
-                f"Order {order_id} sent successfully. "
-                f"Nakrutka ID: {nakrutka_order_id}, "
-                f"Charge: ${result.get('charge', 0)}"
+        try:
+            # Send to Nakrutka API
+            result = await self.nakrutka.create_order(
+                service=order['service_id'],
+                link=order['link'],
+                quantity=order['quantity'],
+                runs=order['runs'] if order['runs'] > 1 else None,
+                interval=order['interval'] if order['runs'] > 1 else None
             )
 
-        else:
-            raise Exception(f"Invalid API response: {result}")
+            if result and 'order' in result:
+                nakrutka_order_id = str(result['order'])
+
+                # Update order status
+                await self.db.execute("""
+                    UPDATE ready_orders 
+                    SET status = 'sent',
+                        nakrutka_order_id = $1,
+                        sent_at = $2
+                    WHERE id = $3
+                """, nakrutka_order_id, datetime.utcnow(), order_id)
+
+                # Log success to database - ВИПРАВЛЕНО: використовуємо JSON для context
+                context_data = {
+                    'order_id': order_id,
+                    'nakrutka_id': nakrutka_order_id,
+                    'service_type': order['service_type'],
+                    'quantity': order['quantity'],
+                    'charge': result.get('charge', 0),
+                    'balance': result.get('balance', 0)
+                }
+
+                await self.db.execute("""
+                    INSERT INTO logs (level, message, context)
+                    VALUES ($1, $2, $3::jsonb)
+                """, 'info', 'Order sent successfully', json.dumps(context_data))
+
+                logger.info(
+                    f"Order created: {nakrutka_order_id}, charge: ${result.get('charge', 0)}"
+                )
+
+            else:
+                raise Exception(f"Invalid API response: {result}")
+
+        except Exception as e:
+            # ВИПРАВЛЕНО: правильна обробка помилок
+            error_message = str(e)
+            logger.error(f"Failed to send order {order_id}: {error_message}")
+
+            # Зберігаємо помилку в БД - використовуємо JSON для context
+            error_context = {
+                'order_id': order_id,
+                'error': error_message[:500]  # Обмежуємо довжину помилки
+            }
+
+            await self.db.execute("""
+                INSERT INTO logs (level, message, context)
+                VALUES ($1, $2, $3::jsonb)
+            """, 'error', f'Failed to send order {order_id}', json.dumps(error_context))
+
+            # Помічаємо замовлення як failed
+            await self.mark_order_failed(order_id, error_message)
 
     async def mark_order_failed(self, order_id: int, error: str):
         """Mark order as failed"""
         await self.db.execute("""
             UPDATE ready_orders 
-            SET status = 'failed'
+            SET status = 'failed',
+                error_message = $2
             WHERE id = $1
-        """, order_id)
-
-        await self.db.execute("""
-            INSERT INTO logs (level, message, context)
-            VALUES ('error', 'Order failed', $1)
-        """, {
-            'order_id': order_id,
-            'error': error
-        })
+        """, order_id, error[:500])  # Обмежуємо довжину помилки
 
     async def send_scheduled_orders(self):
         """Send orders that were scheduled for later"""
@@ -172,3 +180,16 @@ class OrderSender:
                             """, order['id'])
 
                             logger.info(f"Order {order['id']} moved from scheduled to pending")
+
+            elif order['service_type'] == 'reposts':
+                delay_minutes = config.get('reposts', {}).get('delay', 0)
+                time_passed = (datetime.utcnow() - order['created_at']).total_seconds() / 60
+
+                if time_passed >= delay_minutes:
+                    await self.db.execute("""
+                        UPDATE ready_orders
+                        SET status = 'pending'
+                        WHERE id = $1
+                    """, order['id'])
+
+                    logger.info(f"Repost order {order['id']} moved to pending")

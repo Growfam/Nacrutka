@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram SMM Bot - Simplified Main
+Telegram SMM Bot - FIXED VERSION with Polling
 """
 import asyncio
 import signal
@@ -18,26 +18,26 @@ logger = logging.getLogger(__name__)
 # Import components
 from src.config import settings
 from src.database.connection import db
-from src.services.monitor import ChannelMonitor
+from src.services.telegram_poller import TelegramPoller  # НОВИЙ КОМПОНЕНТ
 from src.services.sender import OrderSender
 from src.services.checker import StatusChecker
 from src.database.queries import Queries
 
 
 class TelegramSMMBot:
-    """Main bot application - simplified"""
+    """Main bot application - FIXED VERSION"""
 
     def __init__(self):
         self.db = db
         self.queries = Queries()
-        self.monitor = ChannelMonitor()
+        self.poller = TelegramPoller()  # Замість monitor
         self.sender = OrderSender()
         self.checker = StatusChecker()
         self.running = False
         self.start_time = datetime.utcnow()
 
     async def setup(self):
-        """Initialize database connection"""
+        """Initialize database and Telegram polling"""
         try:
             logger.info("Initializing database...")
             await self.db.init()
@@ -48,6 +48,10 @@ class TelegramSMMBot:
                 logger.info("✅ Database connected")
             else:
                 raise Exception("Database test failed")
+
+            # Setup Telegram polling
+            logger.info("Setting up Telegram polling...")
+            await self.poller.setup()
 
             # Check Nakrutka balance
             try:
@@ -62,15 +66,14 @@ class TelegramSMMBot:
             logger.error(f"❌ Setup failed: {e}")
             raise
 
-    async def monitor_task(self):
-        """Task for monitoring channels"""
-        while self.running:
-            try:
-                await self.monitor.check_channels()
-            except Exception as e:
-                logger.error(f"Monitor error: {e}")
+    async def polling_task(self):
+        """Task for Telegram polling - отримує нові пости"""
+        logger.info("🚀 Starting Telegram polling...")
+        await self.poller.start_polling()
 
-            await asyncio.sleep(settings.check_interval)
+        # Polling працює в фоні
+        while self.running:
+            await asyncio.sleep(10)  # Просто чекаємо
 
     async def sender_task(self):
         """Task for sending orders"""
@@ -110,16 +113,23 @@ class TelegramSMMBot:
         while self.running:
             try:
                 stats = await self.queries.get_stats()
-
                 uptime = (datetime.utcnow() - self.start_time).total_seconds() / 3600
+
+                # Додаємо статистику по постах
+                posts_stats = await self.db.fetchrow("""
+                                                     SELECT COUNT(CASE WHEN is_processed = false THEN 1 END)                   as unprocessed,
+                                                            COUNT(CASE WHEN created_at > NOW() - INTERVAL '1 hour' THEN 1 END) as posts_1h
+                                                     FROM posts
+                                                     """)
 
                 logger.info(
                     f"📊 Stats - "
                     f"Uptime: {uptime:.1f}h | "
                     f"Channels: {stats.get('active_channels', 0)} | "
-                    f"Pending: {stats.get('pending_orders', 0)} | "
-                    f"Sent: {stats.get('sent_orders', 0)} | "
-                    f"24h orders: {stats.get('orders_24h', 0)}"
+                    f"New posts (1h): {posts_stats['posts_1h']} | "
+                    f"Unprocessed: {posts_stats['unprocessed']} | "
+                    f"Pending orders: {stats.get('pending_orders', 0)} | "
+                    f"Sent: {stats.get('sent_orders', 0)}"
                 )
 
             except Exception as e:
@@ -127,38 +137,49 @@ class TelegramSMMBot:
 
             await asyncio.sleep(300)  # Every 5 minutes
 
-    async def cleanup_task(self):
-        """Task for cleanup"""
-        while self.running:
-            try:
-                # Clean old logs
-                deleted = await self.queries.cleanup_logs(days=7)
-                if deleted > 0:
-                    logger.info(f"Cleaned {deleted} old logs")
+    async def process_old_posts_on_start(self):
+        """Обробка старих постів при старті згідно налаштувань"""
+        logger.info("Checking for old posts processing requirements...")
 
-            except Exception as e:
-                logger.error(f"Cleanup error: {e}")
+        channels = await self.db.fetch("""
+                                       SELECT id, username, process_old_posts
+                                       FROM channels
+                                       WHERE is_active = true
+                                         AND process_old_posts > 0
+                                       """)
 
-            await asyncio.sleep(3600)  # Every hour
+        for channel in channels:
+            existing_posts = await self.db.fetchval(
+                "SELECT COUNT(*) FROM posts WHERE channel_id = $1",
+                channel['id']
+            )
+
+            if existing_posts == 0:
+                logger.info(
+                    f"Channel @{channel['username']}: "
+                    f"will process {channel['process_old_posts']} old posts on first message"
+                )
 
     async def start(self):
         """Start the bot"""
         self.running = True
 
+        # Перевіряємо налаштування старих постів
+        await self.process_old_posts_on_start()
+
         logger.info("Starting bot tasks...")
 
         # Create tasks
         tasks = [
-            asyncio.create_task(self.monitor_task()),
+            asyncio.create_task(self.polling_task()),  # Новий polling замість monitor
             asyncio.create_task(self.sender_task()),
             asyncio.create_task(self.checker_task()),
             asyncio.create_task(self.stats_task()),
-            asyncio.create_task(self.cleanup_task()),
         ]
 
         logger.info("=" * 50)
-        logger.info("🟢 BOT IS RUNNING")
-        logger.info(f"Monitor interval: {settings.check_interval}s")
+        logger.info("🟢 BOT IS RUNNING - FIXED VERSION")
+        logger.info("✅ Telegram polling active - will receive new posts automatically")
         logger.info(f"Send interval: {settings.send_interval}s")
         logger.info(f"Check interval: {settings.status_check_interval}s")
         logger.info("Press Ctrl+C to stop")
@@ -174,6 +195,9 @@ class TelegramSMMBot:
         """Stop the bot"""
         logger.info("Stopping bot...")
         self.running = False
+
+        # Stop polling
+        await self.poller.stop()
 
         # Close connections
         await self.sender.nakrutka.close()
@@ -193,7 +217,7 @@ class TelegramSMMBot:
 async def main():
     """Main entry point"""
     logger.info("=" * 50)
-    logger.info("🚀 TELEGRAM SMM BOT (Simplified)")
+    logger.info("🚀 TELEGRAM SMM BOT - FIXED VERSION")
     logger.info("=" * 50)
 
     # Check environment

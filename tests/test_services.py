@@ -6,7 +6,7 @@ import asyncio
 from unittest.mock import Mock, AsyncMock, patch
 
 from src.services.nakrutka import NakrutkaClient
-from src.services.monitor import TelegramMonitor
+from src.services.telegram_poller import TelegramMonitor
 from src.services.sender import PostProcessor
 from src.database.connection import DatabaseConnection
 from src.database.models import *
