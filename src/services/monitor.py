@@ -88,17 +88,29 @@ class ChannelMonitor:
             posts_to_check = []
 
             if existing_count == 0 and process_old_posts > 0:
-                # First run - process old posts
+                # First run - process old posts going backwards from last_post_id
                 for i in range(process_old_posts):
                     post_id = last_post_id - i
                     if post_id > 0:
                         posts_to_check.append(post_id)
             else:
-                # Regular check - last 10 posts
-                for i in range(10):
-                    post_id = last_post_id - i
-                    if post_id > 0:
-                        posts_to_check.append(post_id)
+                # Regular check - check next posts after last_post_id
+                # Get last known post from DB
+                last_known = await self.db.fetchval(
+                    "SELECT MAX(post_id) FROM posts WHERE channel_id = $1",
+                    channel_id
+                )
+
+                if last_known:
+                    # Check posts after last known
+                    for i in range(1, 11):  # Check next 10 posts
+                        posts_to_check.append(last_known + i)
+                else:
+                    # Start from last_post_id
+                    for i in range(10):
+                        post_id = last_post_id - i
+                        if post_id > 0:
+                            posts_to_check.append(post_id)
 
             # Check which posts are new
             if posts_to_check:
@@ -129,19 +141,25 @@ class ChannelMonitor:
             logger.error(f"Failed to check {username}: {e}")
 
     async def get_last_post_id(self, chat_id: int) -> Optional[int]:
-        """Get last post ID from channel"""
+        """Get last post ID from channel - using fixed estimate"""
         try:
-            # Try to get pinned message as reference
-            chat = await self.bot.get_chat(chat_id)
+            # Bot API не дає доступ до історії постів
+            # Потрібно вручну вказати приблизний останній ID
+            # або використовувати Telethon/MTProto
 
-            # If channel has pinned message
-            if hasattr(chat, 'pinned_message') and chat.pinned_message:
-                return chat.pinned_message.message_id
+            # ТИМЧАСОВЕ РІШЕННЯ: використовуємо фіксований ID
+            # Замініть на реальний останній post_id для кожного каналу
+            known_channels = {
+                -1002352719919: 581,  # mark_crypto_inside - останній пост 581
+                # Додайте інші канали тут
+            }
 
-            # Otherwise return estimated value based on channel age
-            # This is simplified - in production use proper method
-            import random
-            return random.randint(100, 10000)
+            if chat_id in known_channels:
+                return known_channels[chat_id]
+
+            # Для невідомих каналів - повертаємо 100 як початкову точку
+            logger.warning(f"Unknown channel {chat_id}, using default post ID 100")
+            return 100
 
         except Exception as e:
             logger.error(f"Could not get last post ID: {e}")
