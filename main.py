@@ -273,30 +273,11 @@ class TelegramSMMBot:
         self.running = False
 
 
-async def run_migrations():
-    """Run database migrations"""
-    logger.info("Running database migrations...")
-
-    try:
-        # Read and execute initial migration
-        with open("migrations/001_initial_schema.sql", "r") as f:
-            schema = f.read()
-        await db.execute(schema)
-        logger.info("✅ Initial schema migration completed")
-
-        # Read and execute Nakrutochka migration
-        with open("migrations/002_nakrutochka_services.sql", "r") as f:
-            nakrutochka_schema = f.read()
-        await db.execute(nakrutochka_schema)
-        logger.info("✅ Nakrutochka integration migration completed")
-
-    except FileNotFoundError as e:
-        logger.warning(f"Migration file not found: {e}")
-    except Exception as e:
-        logger.error(f"Migration error: {e}")
-        # Don't fail if tables already exist
-        if "already exists" not in str(e):
-            raise
+# ВИДАЛЕНО/ЗАКОМЕНТОВАНО МІГРАЦІЇ!
+# async def run_migrations():
+#     """Run database migrations"""
+#     logger.info("Running database migrations...")
+#     ...
 
 
 async def main():
@@ -321,8 +302,8 @@ async def main():
         # Initialize database connection first
         await db.init()
 
-        # Run migrations
-        await run_migrations()
+        # ВИДАЛЕНО виклик run_migrations()!
+        # await run_migrations()
 
         # Create and start bot
         bot = TelegramSMMBot()
