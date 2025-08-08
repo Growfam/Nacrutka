@@ -1,5 +1,6 @@
 """
 Post processor - creates orders for new posts with advanced portion support
+UPDATED: Dynamic portions from metadata, better duplicate prevention, reaction distribution by service_id
 """
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -218,7 +219,7 @@ class PostProcessor(LoggerMixin):
         settings: ChannelSettings,
         api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for views with advanced portion configuration"""
+        """Create orders for views with advanced portion configuration from metadata"""
 
         # Check for duplicates
         existing_views = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.VIEWS)
@@ -236,7 +237,7 @@ class PostProcessor(LoggerMixin):
 
         # Get service ID
         service_ids = settings.twiboost_service_ids or {}
-        service_id = service_ids.get("views", 4217)  # Your specific service ID
+        service_id = service_ids.get("views", 4217)
 
         orders = []
 
@@ -251,8 +252,8 @@ class PostProcessor(LoggerMixin):
                 "service_type": ServiceType.VIEWS,
                 "service_id": service_id,
                 "api_provider": api_provider,
-                "quantity": portion_config['runs'] * portion_config['quantity'],  # Total for this portion
-                "actual_quantity": portion_config['runs'] * portion_config['quantity'],
+                "quantity": portion_config.get('total', portion_config['runs'] * portion_config['quantity']),
+                "actual_quantity": portion_config.get('total', portion_config['runs'] * portion_config['quantity']),
                 "portion_number": portion_config['number'],
                 "portion_size": portion_config['quantity'],  # Per run
                 "runs": portion_config['runs'],
@@ -310,7 +311,7 @@ class PostProcessor(LoggerMixin):
         settings: ChannelSettings,
         api_provider: APIProvider
     ) -> List[Order]:
-        """Create orders for reactions with multiple services"""
+        """Create orders for reactions with distribution by service_id"""
 
         # Check for duplicates
         existing_reactions = await order_repo.get_orders_by_post_and_type(post.id, ServiceType.REACTIONS)
@@ -323,7 +324,7 @@ class PostProcessor(LoggerMixin):
         reaction_distribution = metadata.get('reaction_distribution', {}) if metadata else {}
 
         if not reaction_distribution:
-            # Fallback to simple reactions
+            self.log_error(f"No reaction distribution found for channel {settings.channel_id}")
             return []
 
         # Apply randomization to total
@@ -333,40 +334,58 @@ class PostProcessor(LoggerMixin):
             max_val = int(total_reactions * (1 + settings.randomization_percent / 100))
             total_reactions = random.randint(min_val, max_val)
 
-        # Get service IDs
+        # Get service IDs mapping
         service_ids = settings.nakrutochka_service_ids or {}
 
         orders = []
 
-        # Create orders for each reaction type
-        for reaction_type, percentage in reaction_distribution.items():
-            quantity = int(total_reactions * percentage / 100)
+        # Create orders for each service_id based on distribution
+        remaining_total = total_reactions
+        service_items = list(reaction_distribution.items())
 
-            # Get service ID for this reaction type
-            service_key = f"reaction_{reaction_type}"
-            service_id = service_ids.get(service_key)
-
-            if not service_id:
-                self.log_warning(f"No service ID for reaction type {reaction_type}")
+        for idx, (service_id_str, percentage) in enumerate(service_items):
+            # Convert service_id to int
+            try:
+                nakrutochka_service_id = int(service_id_str)
+            except ValueError:
+                self.log_error(f"Invalid service_id: {service_id_str}")
                 continue
+
+            # Calculate quantity for this service
+            if idx == len(service_items) - 1:
+                # Last service gets remaining to avoid rounding errors
+                quantity = remaining_total
+            else:
+                quantity = int(total_reactions * percentage / 100)
+                remaining_total -= quantity
+
+            if quantity <= 0:
+                continue
+
+            # Check if service exists in database
+            service_key = f"reaction_{nakrutochka_service_id}"
 
             # Calculate drip-feed
             runs = max(1, quantity // settings.drops_per_run)
+            quantity_per_run = quantity // runs
+
+            # Adjust last run to include remainder
+            last_run_extra = quantity % runs
 
             order_data = {
                 "post_id": post.id,
                 "service_type": ServiceType.REACTIONS,
-                "service_id": service_id,
+                "service_id": nakrutochka_service_id,  # Direct service_id from distribution
                 "api_provider": api_provider,
                 "quantity": quantity,
                 "actual_quantity": quantity,
                 "portion_number": 1,
-                "portion_size": settings.drops_per_run,
-                "reaction_emoji": reaction_type,  # Store reaction type
+                "portion_size": quantity_per_run,
                 "runs": runs,
                 "interval": settings.run_interval,
                 "scheduled_at": datetime.now(),
-                "post_link": post.link
+                "post_link": post.link,
+                "response_data": {"last_run_extra": last_run_extra} if last_run_extra > 0 else None
             }
 
             order = await order_repo.create_order(order_data)
@@ -374,10 +393,11 @@ class PostProcessor(LoggerMixin):
                 orders.append(order)
 
                 self.log_info(
-                    f"Reaction order created for {reaction_type}",
+                    f"Reaction order created for service {nakrutochka_service_id}",
                     order_id=order.id,
                     quantity=quantity,
-                    service_id=service_id,
+                    service_id=nakrutochka_service_id,
+                    percentage=percentage,
                     runs=runs,
                     interval=settings.run_interval,
                     link=post.link
@@ -401,7 +421,7 @@ class PostProcessor(LoggerMixin):
 
         # Get service ID
         service_ids = settings.nakrutochka_service_ids or {}
-        service_id = service_ids.get("reposts", 3943)  # Your specific service ID
+        service_id = service_ids.get("reposts", 3943)
 
         # Apply randomization
         quantity = settings.base_quantity
@@ -505,6 +525,30 @@ class PostProcessor(LoggerMixin):
 
         if reprocess_count > 0:
             return await self.process_new_posts(reprocess_count)
+        return 0
+
+    async def process_old_posts_for_channel(self, channel_id: int, start_message_id: int, max_posts: int = 1):
+        """Process specific old posts for a channel"""
+        self.log_info(
+            f"Processing old posts for channel {channel_id}",
+            start_message_id=start_message_id,
+            max_posts=max_posts
+        )
+
+        # Add old post if not exists
+        post_data = {
+            "channel_id": channel_id,
+            "message_id": start_message_id,
+            "content": "Old post for processing",
+            "status": PostStatus.NEW
+        }
+
+        post = await post_repo.create_post(post_data)
+
+        if post:
+            await self._process_single_post(post)
+            return 1
+
         return 0
 
 
